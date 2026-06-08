@@ -341,7 +341,10 @@ export default function App() {
   const [exitPrice, setExitPrice] = useState('')
   const belowPDLRef = useRef(0)
   const [tradeLog, setTradeLog] = useState(()=>{
-    try{return JSON.parse(localStorage.getItem('nifty_tradelog')||'[]')}catch{return[]}
+    try{
+      if(typeof window==='undefined') return []
+      return JSON.parse(localStorage.getItem('nifty_tradelog')||'[]')
+    }catch{return[]}
   })
 
   // Load expiries once
@@ -439,7 +442,7 @@ export default function App() {
     }
     const newLog = [entry,...tradeLog].slice(0,30)
     setTradeLog(newLog)
-    try{localStorage.setItem('nifty_tradelog',JSON.stringify(newLog))}catch{}
+    try{if(typeof window!=='undefined') localStorage.setItem('nifty_tradelog',JSON.stringify(newLog))}catch{}
   }
 
   const logExit = (id) => {
@@ -452,7 +455,7 @@ export default function App() {
       return {...t,exitPrice:price,pnl}
     })
     setTradeLog(updated2)
-    try{localStorage.setItem('nifty_tradelog',JSON.stringify(updated2))}catch{}
+    try{if(typeof window!=='undefined') localStorage.setItem('nifty_tradelog',JSON.stringify(updated2))}catch{}
     setExitingId(null); setExitPrice('')
   }
 
@@ -463,7 +466,6 @@ export default function App() {
 
   return (
     <div style={{background:'#070a0f',minHeight:'100vh',color:'#e2e8f0',fontFamily:"'JetBrains Mono',monospace",padding:'0 0 80px'}}>
-      <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Syne:wght@800&display=swap" rel="stylesheet"/>
 
       {/* Header */}
       <div style={{background:'#0d1117',borderBottom:'1px solid #1e2a3a',padding:'14px 16px',position:'sticky',top:0,zIndex:10}}>
@@ -736,3 +738,4 @@ export default function App() {
     </div>
   )
 }
+
