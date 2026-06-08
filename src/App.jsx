@@ -143,12 +143,19 @@ function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles) {
   let todayHigh=spot,todayLow=spot
   if(candles?.length){todayHigh=Math.max(...candles.map(c=>c[2]||spot));todayLow=Math.min(...candles.map(c=>c[3]||spot))}
   const dayRange=todayHigh-todayLow
-  const tightRange=dayRange<em*0.65
+
+  // Sustained trend: needs 3 consecutive closes in same direction AND each move > 0.1% of spot
+  // Prevents minor drift from being misclassified as a trend
   let sustained=false
   if(candles&&candles.length>=3){
     const c3=candles.slice(-3).map(c=>safe(()=>c[4],spot))
-    sustained=(c3[0]<c3[1]&&c3[1]<c3[2])||(c3[0]>c3[1]&&c3[1]>c3[2])
+    const minMove=spot*0.001  // 0.1% of spot (~23 pts on Nifty 23000)
+    const allUp=c3[0]<c3[1]&&c3[1]<c3[2]&&(c3[1]-c3[0])>minMove&&(c3[2]-c3[1])>minMove
+    const allDown=c3[0]>c3[1]&&c3[1]>c3[2]&&(c3[0]-c3[1])>minMove&&(c3[1]-c3[2])>minMove
+    sustained=allUp||allDown
   }
+
+  const tightRange=dayRange<em*0.65
   const isChannel=insidePDHL&&tightRange&&!sustained
   const isTrend=!insidePDHL||sustained||dayRange>em*0.9
   const nearSup=isChannel&&wallPos<0.25
@@ -172,68 +179,53 @@ function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles) {
 }
 
 // ── ENTRY / SL / TARGET ───────────────────────────────────────────────────────
-// All levels computed from Nifty spot levels × option delta
-// SL logic:
-//   CE Buy → Nifty SL = nearest intraday support (low of last candle or PE wall)
-//             invalidation if Nifty breaks below SL level
-//   PE Buy → Nifty SL = nearest intraday resistance (high of last candle or CE wall)
-// Target = next wall in direction of trade (R for CE, S for PE)
-// Option SL   = entry - (Nifty SL distance × |delta|)
-// Option TGT  = entry + (Nifty TGT distance × |delta|)
-function calcLevels(side, ltp, delta, spot, a, candles, rows) {
+// Channel: SL = just outside the wall that invalidates the setup. Target = opposite wall.
+// Trend:   SL = recent candle swing. Target = next major OI wall in direction of trade.
+function calcLevels(side, ltp, delta, spot, a, candles, rows, isChannel) {
   if(!ltp||!delta||!spot) return null
   const absDelta = Math.abs(delta)
   if(absDelta < 0.05) return null
 
-  const intradayLow  = safe(()=>Math.min(...candles.slice(-2).map(c=>c[3])), null)
-  const intradayHigh = safe(()=>Math.max(...candles.slice(-2).map(c=>c[2])), null)
+  let niftySL, niftyTGT
 
   if(side === 'ce') {
-    // SL must always be BELOW spot — use intraday low or fallback to 0.5% below spot
-    const rawSL = intradayLow ? intradayLow - 20 : spot * 0.995
-    const niftySL = Math.round(Math.min(rawSL, spot - 30)) // always at least 30pts below
-
-    // Target: heaviest CE wall above spot
-    const ceAbove = safe(()=>{
-      const above = rows.filter(r => r.strike > spot)
-      if(!above.length) return spot + 300
-      return above.reduce((b,r) => r.ce_oi > b.ce_oi ? r : b, above[0]).strike
-    }, spot + 300)
-    const niftyTGT = Math.round(ceAbove)
-
-    const niftySlDist  = Math.max(30, spot - niftySL)
-    const niftyTgtDist = Math.max(0, niftyTGT - spot)
-    const optionEntry  = +ltp.toFixed(1)
-    const optionSL     = Math.max(0.5, +(ltp - niftySlDist * absDelta).toFixed(1))
-    const optionTGT    = +(ltp + niftyTgtDist * absDelta).toFixed(1)
-    const rr           = +(niftyTgtDist / niftySlDist).toFixed(1)
-
-    return { niftySL, niftyTGT, niftySlDist, niftyTgtDist,
-      optionEntry, optionSL, optionTGT, rr, side: 'ce' }
-
+    if(isChannel) {
+      // Channel scalp: entered near support → SL below support wall, Target = resistance wall
+      niftySL  = Math.round(a.S - 30)
+      niftyTGT = Math.round(a.R)
+    } else {
+      // Trend: SL below recent candle low, Target = heaviest CE wall above spot
+      const cLow = safe(()=>Math.min(...(candles||[]).slice(-2).map(c=>c[3])), spot-50)
+      niftySL  = Math.round(Math.min(cLow - 20, spot - 30))
+      niftyTGT = safe(()=>{
+        const ab=rows.filter(r=>r.strike>spot)
+        return ab.length?ab.reduce((b,r)=>r.ce_oi>b.ce_oi?r:b,ab[0]).strike:spot+300
+      }, spot+300)
+    }
   } else {
-    // SL must always be ABOVE spot
-    const rawSL = intradayHigh ? intradayHigh + 20 : spot * 1.005
-    const niftySL = Math.round(Math.max(rawSL, spot + 30))
-
-    // Target: heaviest PE wall below spot
-    const peBelow = safe(()=>{
-      const below = rows.filter(r => r.strike < spot)
-      if(!below.length) return spot - 300
-      return below.reduce((b,r) => r.pe_oi > b.pe_oi ? r : b, below[0]).strike
-    }, spot - 300)
-    const niftyTGT = Math.round(peBelow)
-
-    const niftySlDist  = Math.max(30, niftySL - spot)
-    const niftyTgtDist = Math.max(0, spot - niftyTGT)
-    const optionEntry  = +ltp.toFixed(1)
-    const optionSL     = Math.max(0.5, +(ltp - niftySlDist * absDelta).toFixed(1))
-    const optionTGT    = +(ltp + niftyTgtDist * absDelta).toFixed(1)
-    const rr           = +(niftyTgtDist / niftySlDist).toFixed(1)
-
-    return { niftySL, niftyTGT, niftySlDist, niftyTgtDist,
-      optionEntry, optionSL, optionTGT, rr, side: 'pe' }
+    if(isChannel) {
+      // Channel scalp: entered near resistance → SL above resistance wall, Target = support wall
+      niftySL  = Math.round(a.R + 30)
+      niftyTGT = Math.round(a.S)
+    } else {
+      // Trend: SL above recent candle high, Target = heaviest PE wall below spot
+      const cHigh = safe(()=>Math.max(...(candles||[]).slice(-2).map(c=>c[2])), spot+50)
+      niftySL  = Math.round(Math.max(cHigh + 20, spot + 30))
+      niftyTGT = safe(()=>{
+        const bl=rows.filter(r=>r.strike<spot)
+        return bl.length?bl.reduce((b,r)=>r.pe_oi>b.pe_oi?r:b,bl[0]).strike:spot-300
+      }, spot-300)
+    }
   }
+
+  const niftySlDist  = side==='ce' ? Math.max(30, spot-niftySL) : Math.max(30, niftySL-spot)
+  const niftyTgtDist = side==='ce' ? Math.max(0, niftyTGT-spot) : Math.max(0, spot-niftyTGT)
+  const optionEntry  = +ltp.toFixed(1)
+  const optionSL     = Math.max(0.5, +(ltp - niftySlDist * absDelta).toFixed(1))
+  const optionTGT    = +(ltp + niftyTgtDist * absDelta).toFixed(1)
+  const rr           = +(niftyTgtDist / niftySlDist).toFixed(1)
+
+  return { optionEntry, optionSL, optionTGT, rr, niftySlDist, niftyTgtDist, niftySL, niftyTGT }
 }
 
 // ── RECOMMENDATION ────────────────────────────────────────────────────────────
@@ -249,7 +241,7 @@ function getRec(rows, spot, a, vix, candles) {
     if(!aff.length) return null
     aff.sort((a,b)=>b._ad-a._ad||a[lt]-b[lt])
     const row=aff[0],cost=row[lt]*LOT
-    const levels=calcLevels(side, row[lt], row[dl], spot, a, candles||[], rows)
+    const levels=calcLevels(side, row[lt], row[dl], spot, a, candles||[], rows, isChannel)
     return {strike:row.strike,ltp:row[lt],delta:row[dl],theta:row[`${side}_theta`],iv:row[`${side}_iv`],
       cost,lots:Math.floor(BUDGET/cost),moneyness:Math.round(side==='ce'?spot-row.strike:row.strike-spot),
       lowQ:Math.abs(row[dl])<0.30, levels}
