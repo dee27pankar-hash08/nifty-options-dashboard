@@ -171,8 +171,64 @@ function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles) {
   }
 }
 
+// ── ENTRY / SL / TARGET ───────────────────────────────────────────────────────
+// All levels computed from Nifty spot levels × option delta
+// SL logic:
+//   CE Buy → Nifty SL = nearest intraday support (low of last candle or PE wall)
+//             invalidation if Nifty breaks below SL level
+//   PE Buy → Nifty SL = nearest intraday resistance (high of last candle or CE wall)
+// Target = next wall in direction of trade (R for CE, S for PE)
+// Option SL   = entry - (Nifty SL distance × |delta|)
+// Option TGT  = entry + (Nifty TGT distance × |delta|)
+function calcLevels(side, ltp, delta, spot, a, candles) {
+  if(!ltp||!delta||!spot) return null
+  const absDelta = Math.abs(delta)
+  if(absDelta < 0.05) return null
+
+  // Intraday candle high/low for tighter SL
+  let intradayLow  = safe(()=>Math.min(...candles.slice(-2).map(c=>c[3])), null)
+  let intradayHigh = safe(()=>Math.max(...candles.slice(-2).map(c=>c[2])), null)
+
+  if(side === 'ce') {
+    // CE Buy: SL if Nifty breaks below support
+    // Use tighter of: PE wall (a.S) or last 2-candle low
+    const niftySL   = Math.round(intradayLow ? Math.max(intradayLow - 20, a.S) : a.S)
+    const niftyTGT  = Math.round(a.R)  // target = resistance wall
+    const niftySlDist  = Math.max(0, spot - niftySL)
+    const niftyTgtDist = Math.max(0, niftyTGT - spot)
+
+    const optionEntry = +ltp.toFixed(1)
+    const optionSL    = +(ltp - niftySlDist * absDelta).toFixed(1)
+    const optionTGT   = +(ltp + niftyTgtDist * absDelta).toFixed(1)
+    const rr          = niftySlDist > 0 ? +(niftyTgtDist / niftySlDist).toFixed(1) : null
+
+    return {
+      niftySL, niftyTGT, niftySlDist, niftyTgtDist,
+      optionEntry, optionSL: Math.max(0.5, optionSL), optionTGT,
+      rr, side: 'ce'
+    }
+  } else {
+    // PE Buy: SL if Nifty breaks above resistance
+    const niftySL   = Math.round(intradayHigh ? Math.min(intradayHigh + 20, a.R) : a.R)
+    const niftyTGT  = Math.round(a.S)  // target = support wall
+    const niftySlDist  = Math.max(0, niftySL - spot)
+    const niftyTgtDist = Math.max(0, spot - niftyTGT)
+
+    const optionEntry = +ltp.toFixed(1)
+    const optionSL    = +(ltp - niftySlDist * absDelta).toFixed(1)
+    const optionTGT   = +(ltp + niftyTgtDist * absDelta).toFixed(1)
+    const rr          = niftySlDist > 0 ? +(niftyTgtDist / niftySlDist).toFixed(1) : null
+
+    return {
+      niftySL, niftyTGT, niftySlDist, niftyTgtDist,
+      optionEntry, optionSL: Math.max(0.5, optionSL), optionTGT,
+      rr, side: 'pe'
+    }
+  }
+}
+
 // ── RECOMMENDATION ────────────────────────────────────────────────────────────
-function getRec(rows, spot, a, vix) {
+function getRec(rows, spot, a, vix, candles) {
   if(!a) return {type:'No Trade',logic:'Analysis unavailable'}
   const {bias,conv,timeWarning,nearSup,nearRes,isChannel,isTrend,regime}=a
   if(timeWarning) return {type:'Wait',logic:timeWarning}
@@ -184,9 +240,10 @@ function getRec(rows, spot, a, vix) {
     if(!aff.length) return null
     aff.sort((a,b)=>b._ad-a._ad||a[lt]-b[lt])
     const row=aff[0],cost=row[lt]*LOT
+    const levels=calcLevels(side, row[lt], row[dl], spot, a, candles||[])
     return {strike:row.strike,ltp:row[lt],delta:row[dl],theta:row[`${side}_theta`],iv:row[`${side}_iv`],
       cost,lots:Math.floor(BUDGET/cost),moneyness:Math.round(side==='ce'?spot-row.strike:row.strike-spot),
-      lowQ:Math.abs(row[dl])<0.30}
+      lowQ:Math.abs(row[dl])<0.30, levels}
   })
 
   if(isChannel){
@@ -283,7 +340,7 @@ export default function App() {
       const ceW=[...near].sort((a,b)=>b.ce_oi-a.ce_oi).slice(0,3)
       const peW=[...near].sort((a,b)=>b.pe_oi-a.pe_oi).slice(0,3)
       const a=safe(()=>analyse(rows,spot,dte,oiData,vix,pdh,pdl,ic))
-      const rec=safe(()=>getRec(rows,spot,a,vix),{type:'No Trade',logic:'Analysis error'})
+      const rec=safe(()=>getRec(rows,spot,a,vix,ic),{type:'No Trade',logic:'Analysis error'})
       setData({spot,rows,dte,ceW,peW,a,rec,vix,pdh,pdl})
       setUpdated(new Date())
     }).catch(e=>setErr(String(e?.message||e)))
@@ -448,6 +505,36 @@ export default function App() {
               </div>}
             </div>
             {data.rec.ltp&&<div style={{marginTop:8,fontSize:11,color:'#475569'}}>LTP ₹{data.rec.ltp} · Δ {Math.abs(data.rec.delta||0).toFixed(2)} · {Math.abs(data.rec.moneyness||0)} pts {(data.rec.moneyness||0)>=0?'ITM':'OTM'} · θ {(data.rec.theta||0).toFixed(0)}/day · IV {(data.rec.iv||0).toFixed(0)}</div>}
+
+            {/* Entry / SL / Target levels */}
+            {data.rec.levels&&(()=>{
+              const lv=data.rec.levels
+              const rrColor=lv.rr>=2?'#22c55e':lv.rr>=1.5?'#86efac':'#fb923c'
+              return (
+                <div style={{marginTop:12,padding:12,background:'#0a0f1a',borderRadius:8,border:'1px solid #1e2a3a'}}>
+                  <div style={{fontSize:10,color:'#475569',marginBottom:8,fontWeight:700}}>LEVELS (option price)</div>
+                  <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:8,marginBottom:10}}>
+                    <div style={{textAlign:'center'}}>
+                      <div style={{fontSize:9,color:'#475569',marginBottom:3}}>ENTRY</div>
+                      <div style={{fontSize:16,fontWeight:700,color:'#f8fafc'}}>₹{lv.optionEntry}</div>
+                    </div>
+                    <div style={{textAlign:'center'}}>
+                      <div style={{fontSize:9,color:'#ef4444',marginBottom:3}}>SL</div>
+                      <div style={{fontSize:16,fontWeight:700,color:'#ef4444'}}>₹{lv.optionSL}</div>
+                    </div>
+                    <div style={{textAlign:'center'}}>
+                      <div style={{fontSize:9,color:'#22c55e',marginBottom:3}}>TARGET</div>
+                      <div style={{fontSize:16,fontWeight:700,color:'#22c55e'}}>₹{lv.optionTGT}</div>
+                    </div>
+                  </div>
+                  <div style={{fontSize:10,color:'#475569',borderTop:'1px solid #1e2a3a',paddingTop:8,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                    <span>Nifty SL: {lv.niftySL} ({lv.niftySlDist} pts)</span>
+                    <span>Nifty TGT: {lv.niftyTGT} ({lv.niftyTgtDist} pts)</span>
+                    {lv.rr&&<span style={{color:rrColor,fontWeight:700}}>R:R {lv.rr}:1</span>}
+                  </div>
+                </div>
+              )
+            })()}
             {data.rec.ceLtp&&<div style={{marginTop:8,fontSize:11,color:'#475569'}}>CE ₹{data.rec.ceLtp} + PE ₹{data.rec.peLtp}</div>}
             <div style={{marginTop:8,fontSize:11,color:'#475569',fontStyle:'italic'}}>{data.rec.logic}</div>
             {data.rec.lowQ&&<div style={{marginTop:6,fontSize:11,color:'#fb923c'}}>⚠ Far-OTM only within budget</div>}
