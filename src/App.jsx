@@ -85,7 +85,19 @@ function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles) {
 
   // PDH/PDL
   let pdhlV=0
-  if(pdh&&pdl&&pdh>pdl){const pos=(spot-pdl)/(pdh-pdl);pdhlV=clip((0.5-pos)*2)}
+  if(pdh&&pdl&&pdh>pdl){
+    if(spot>pdh){
+      // Broken above PDH — bullish breakout
+      pdhlV=0.5
+    } else if(spot<pdl){
+      // Broken below PDL — bearish breakdown
+      pdhlV=-0.5
+    } else {
+      // Inside range — position within range
+      const pos=(spot-pdl)/(pdh-pdl)
+      pdhlV=clip((0.5-pos)*2)
+    }
+  }
 
   // 30min candles
   let trendV=0,trend='unknown',tLc=null,tPc=null
@@ -254,9 +266,20 @@ function getRec(rows, spot, a, vix, candles) {
   }
 
   if(isTrend){
-    if(bias==='NEUTRAL'||conv<25) return{type:'No Trade',logic:`TREND MODE (${regime}): Conviction ${conv}% too low for entry.`}
-    if(bias.includes('BULLISH')){const d=pick('ce');return{type:'CE Buy',...d,logic:`TREND MODE (${regime}): ${bias} — ride the trend.`}}
-    const d=pick('pe');return{type:'PE Buy',...d,logic:`TREND MODE (${regime}): ${bias} — ride the trend.`}
+    // In a clear trend, the regime IS the signal — bypass conviction gating
+    // TRENDING DOWN (broke below PDL) → PE Buy
+    // TRENDING UP (broke above PDH) → CE Buy
+    // Generic TRENDING (sustained candles) → use bias if any, else trade trend direction
+    if(regime==='TRENDING DOWN'||(regime==='TRENDING'&&bias.includes('BEAR'))){
+      const d=pick('pe')
+      return{type:'PE Buy',...d,logic:`TREND MODE (${regime}): Bearish — ride the downtrend. SL above recent swing high.`}
+    }
+    if(regime==='TRENDING UP'||(regime==='TRENDING'&&bias.includes('BULL'))){
+      const d=pick('ce')
+      return{type:'CE Buy',...d,logic:`TREND MODE (${regime}): Bullish — ride the uptrend. SL below recent swing low.`}
+    }
+    // Generic trend with no clear bias — stay out
+    return{type:'No Trade',logic:`TREND MODE (${regime}): Direction unclear. Wait for confirmation.`}
   }
 
   // Default / no candle data
