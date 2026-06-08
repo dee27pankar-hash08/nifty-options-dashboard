@@ -180,50 +180,63 @@ function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles) {
 // Target = next wall in direction of trade (R for CE, S for PE)
 // Option SL   = entry - (Nifty SL distance × |delta|)
 // Option TGT  = entry + (Nifty TGT distance × |delta|)
-function calcLevels(side, ltp, delta, spot, a, candles) {
+function calcLevels(side, ltp, delta, spot, a, candles, rows) {
   if(!ltp||!delta||!spot) return null
   const absDelta = Math.abs(delta)
   if(absDelta < 0.05) return null
 
-  // Intraday candle high/low for tighter SL
-  let intradayLow  = safe(()=>Math.min(...candles.slice(-2).map(c=>c[3])), null)
-  let intradayHigh = safe(()=>Math.max(...candles.slice(-2).map(c=>c[2])), null)
+  const intradayLow  = safe(()=>Math.min(...candles.slice(-2).map(c=>c[3])), null)
+  const intradayHigh = safe(()=>Math.max(...candles.slice(-2).map(c=>c[2])), null)
 
   if(side === 'ce') {
-    // CE Buy: SL if Nifty breaks below support
-    // Use tighter of: PE wall (a.S) or last 2-candle low
-    const niftySL   = Math.round(intradayLow ? Math.max(intradayLow - 20, a.S) : a.S)
-    const niftyTGT  = Math.round(a.R)  // target = resistance wall
+    // SL: tighter of intraday low or PE wall
+    const slLevel = intradayLow
+      ? Math.max(intradayLow - 20, a.S)
+      : a.S
+    const niftySL = Math.round(slLevel)
+
+    // Target: nearest CE wall ABOVE spot (not just a.R which may be below spot in strong trend)
+    const ceAbove = safe(()=>{
+      const near = rows.filter(r => r.strike > spot)
+      if(!near.length) return a.R
+      return near.reduce((b,r) => r.ce_oi > b.ce_oi ? r : b, near[0]).strike
+    }, a.R)
+    const niftyTGT = Math.round(ceAbove)
+
     const niftySlDist  = Math.max(0, spot - niftySL)
     const niftyTgtDist = Math.max(0, niftyTGT - spot)
+    const optionEntry  = +ltp.toFixed(1)
+    const optionSL     = +(ltp - niftySlDist * absDelta).toFixed(1)
+    const optionTGT    = +(ltp + niftyTgtDist * absDelta).toFixed(1)
+    const rr           = niftySlDist > 0 ? +(niftyTgtDist / niftySlDist).toFixed(1) : null
 
-    const optionEntry = +ltp.toFixed(1)
-    const optionSL    = +(ltp - niftySlDist * absDelta).toFixed(1)
-    const optionTGT   = +(ltp + niftyTgtDist * absDelta).toFixed(1)
-    const rr          = niftySlDist > 0 ? +(niftyTgtDist / niftySlDist).toFixed(1) : null
+    return { niftySL, niftyTGT, niftySlDist, niftyTgtDist,
+      optionEntry, optionSL: Math.max(0.5, optionSL), optionTGT, rr, side: 'ce' }
 
-    return {
-      niftySL, niftyTGT, niftySlDist, niftyTgtDist,
-      optionEntry, optionSL: Math.max(0.5, optionSL), optionTGT,
-      rr, side: 'ce'
-    }
   } else {
-    // PE Buy: SL if Nifty breaks above resistance
-    const niftySL   = Math.round(intradayHigh ? Math.min(intradayHigh + 20, a.R) : a.R)
-    const niftyTGT  = Math.round(a.S)  // target = support wall
+    // SL: tighter of intraday high or CE wall
+    const slLevel = intradayHigh
+      ? Math.min(intradayHigh + 20, a.R)
+      : a.R
+    const niftySL = Math.round(slLevel)
+
+    // Target: nearest PE wall BELOW spot
+    const peBelow = safe(()=>{
+      const near = rows.filter(r => r.strike < spot)
+      if(!near.length) return a.S
+      return near.reduce((b,r) => r.pe_oi > b.pe_oi ? r : b, near[0]).strike
+    }, a.S)
+    const niftyTGT = Math.round(peBelow)
+
     const niftySlDist  = Math.max(0, niftySL - spot)
     const niftyTgtDist = Math.max(0, spot - niftyTGT)
+    const optionEntry  = +ltp.toFixed(1)
+    const optionSL     = +(ltp - niftySlDist * absDelta).toFixed(1)
+    const optionTGT    = +(ltp + niftyTgtDist * absDelta).toFixed(1)
+    const rr           = niftySlDist > 0 ? +(niftyTgtDist / niftySlDist).toFixed(1) : null
 
-    const optionEntry = +ltp.toFixed(1)
-    const optionSL    = +(ltp - niftySlDist * absDelta).toFixed(1)
-    const optionTGT   = +(ltp + niftyTgtDist * absDelta).toFixed(1)
-    const rr          = niftySlDist > 0 ? +(niftyTgtDist / niftySlDist).toFixed(1) : null
-
-    return {
-      niftySL, niftyTGT, niftySlDist, niftyTgtDist,
-      optionEntry, optionSL: Math.max(0.5, optionSL), optionTGT,
-      rr, side: 'pe'
-    }
+    return { niftySL, niftyTGT, niftySlDist, niftyTgtDist,
+      optionEntry, optionSL: Math.max(0.5, optionSL), optionTGT, rr, side: 'pe' }
   }
 }
 
@@ -240,7 +253,7 @@ function getRec(rows, spot, a, vix, candles) {
     if(!aff.length) return null
     aff.sort((a,b)=>b._ad-a._ad||a[lt]-b[lt])
     const row=aff[0],cost=row[lt]*LOT
-    const levels=calcLevels(side, row[lt], row[dl], spot, a, candles||[])
+    const levels=calcLevels(side, row[lt], row[dl], spot, a, candles||[], rows)
     return {strike:row.strike,ltp:row[lt],delta:row[dl],theta:row[`${side}_theta`],iv:row[`${side}_iv`],
       cost,lots:Math.floor(BUDGET/cost),moneyness:Math.round(side==='ce'?spot-row.strike:row.strike-spot),
       lowQ:Math.abs(row[dl])<0.30, levels}
@@ -512,26 +525,24 @@ export default function App() {
               const rrColor=lv.rr>=2?'#22c55e':lv.rr>=1.5?'#86efac':'#fb923c'
               return (
                 <div style={{marginTop:12,padding:12,background:'#0a0f1a',borderRadius:8,border:'1px solid #1e2a3a'}}>
-                  <div style={{fontSize:10,color:'#475569',marginBottom:8,fontWeight:700}}>LEVELS (option price)</div>
-                  <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:8,marginBottom:10}}>
-                    <div style={{textAlign:'center'}}>
-                      <div style={{fontSize:9,color:'#475569',marginBottom:3}}>ENTRY</div>
-                      <div style={{fontSize:16,fontWeight:700,color:'#f8fafc'}}>₹{lv.optionEntry}</div>
+                  <div style={{fontSize:10,color:'#475569',marginBottom:10,fontWeight:700}}>TRADE LEVELS</div>
+                  <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:8}}>
+                    <div style={{textAlign:'center',background:'#111827',borderRadius:6,padding:'10px 6px'}}>
+                      <div style={{fontSize:9,color:'#475569',marginBottom:4}}>ENTRY</div>
+                      <div style={{fontSize:20,fontWeight:700,color:'#f8fafc'}}>₹{lv.optionEntry}</div>
                     </div>
-                    <div style={{textAlign:'center'}}>
-                      <div style={{fontSize:9,color:'#ef4444',marginBottom:3}}>SL</div>
-                      <div style={{fontSize:16,fontWeight:700,color:'#ef4444'}}>₹{lv.optionSL}</div>
+                    <div style={{textAlign:'center',background:'#1c0a0a',borderRadius:6,padding:'10px 6px'}}>
+                      <div style={{fontSize:9,color:'#ef4444',marginBottom:4}}>STOP LOSS</div>
+                      <div style={{fontSize:20,fontWeight:700,color:'#ef4444'}}>₹{lv.optionSL}</div>
+                      <div style={{fontSize:9,color:'#475569',marginTop:2}}>−₹{(lv.optionEntry-lv.optionSL).toFixed(1)}</div>
                     </div>
-                    <div style={{textAlign:'center'}}>
-                      <div style={{fontSize:9,color:'#22c55e',marginBottom:3}}>TARGET</div>
-                      <div style={{fontSize:16,fontWeight:700,color:'#22c55e'}}>₹{lv.optionTGT}</div>
+                    <div style={{textAlign:'center',background:'#052e16',borderRadius:6,padding:'10px 6px'}}>
+                      <div style={{fontSize:9,color:'#22c55e',marginBottom:4}}>TARGET</div>
+                      <div style={{fontSize:20,fontWeight:700,color:'#22c55e'}}>₹{lv.optionTGT}</div>
+                      <div style={{fontSize:9,color:'#475569',marginTop:2}}>+₹{(lv.optionTGT-lv.optionEntry).toFixed(1)}</div>
                     </div>
                   </div>
-                  <div style={{fontSize:10,color:'#475569',borderTop:'1px solid #1e2a3a',paddingTop:8,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-                    <span>Nifty SL: {lv.niftySL} ({lv.niftySlDist} pts)</span>
-                    <span>Nifty TGT: {lv.niftyTGT} ({lv.niftyTgtDist} pts)</span>
-                    {lv.rr&&<span style={{color:rrColor,fontWeight:700}}>R:R {lv.rr}:1</span>}
-                  </div>
+                  {lv.rr&&<div style={{marginTop:8,textAlign:'center',fontSize:12,fontWeight:700,color:rrColor}}>R:R {lv.rr}:1</div>}
                 </div>
               )
             })()}
