@@ -166,9 +166,8 @@ function getRec(rows, spot, a, vix) {
 
   const pick=(side)=>{
     const ltp=`${side}_ltp`,dlt=`${side}_delta`
-    const aff=rows.filter(r=>r[ltp]*LOT<=BUDGET&&r[ltp]>0.5)
+    const aff=rows.filter(r=>r[ltp]*LOT<=BUDGET&&r[ltp]>0.5).map(r=>({...r,_ad:Math.abs(r[dlt])}))
     if(!aff.length) return null
-    aff.forEach(r=>r._ad=Math.abs(r[dlt]))
     aff.sort((a,b)=>b._ad-a._ad||a[ltp]-b[ltp])
     const row=aff[0],cost=row[ltp]*LOT
     const mon=side==='ce'?spot-row.strike:row.strike-spot
@@ -224,6 +223,9 @@ function isOpen(){
 const BIAS_COL={BULLISH:'#22c55e','CAUTIOUSLY BULLISH':'#86efac','CAUTIOUSLY BEARISH':'#fb923c',BEARISH:'#ef4444',NEUTRAL:'#94a3b8'}
 const REC_COL={'CE Buy':'#22c55e','PE Buy':'#ef4444',Straddle:'#fb923c','No Trade':'#64748b',Wait:'#f59e0b'}
 
+// Outside component — never affected by re-renders
+let isFetching = false
+
 export default function App() {
   const [data,  setData]  = useState(null)
   const [err,   setErr]   = useState(null)
@@ -231,11 +233,12 @@ export default function App() {
   const [updated,setUpdated] = useState(null)
   const [expiry, setExpiry] = useState(null)
   const [expiries,setExpiries] = useState([])
-  const busy = useRef(false)
+  const expiryRef = useRef(null)
 
   const fetchData = (sel) => {
-    if(!sel||busy.current) return
-    busy.current=true
+    if(!sel||isFetching) return
+    isFetching = true
+    expiryRef.current = sel
     setLoading(true)
     setErr(null)
     const to=todayStr()
@@ -277,7 +280,7 @@ export default function App() {
     }).catch(e=>{
       setErr(e.message)
     }).finally(()=>{
-      busy.current=false
+      isFetching = false
       setLoading(false)
     })
   }
@@ -289,6 +292,7 @@ export default function App() {
         const nearest=list.find(e=>e>=todayStr())||list[0]
         setExpiries(list.slice(0,6))
         setExpiry(nearest)
+        expiryRef.current = nearest
       }).catch(e=>setErr('Expiry load failed: '+e.message))
   },[])
 
@@ -322,7 +326,7 @@ export default function App() {
             <div style={{fontFamily:"'Syne',sans-serif",fontWeight:800,fontSize:22,color:'#f8fafc'}}>
               {data?`₹${data.spot.toLocaleString('en-IN',{minimumFractionDigits:2})}`:'—'}
             </div>
-            <button onClick={()=>fetchData(expiry)} disabled={loading}
+            <button onClick={()=>{ isFetching=false; fetchData(expiryRef.current||expiry) }} disabled={loading}
               style={{background:loading?'#1e2a3a':'#1d4ed8',border:'none',borderRadius:4,color:'#fff',fontSize:10,padding:'3px 10px',cursor:loading?'default':'pointer',fontFamily:'inherit',marginTop:2}}>
               {loading?'LOADING...':'↻ REFRESH'}
             </button>
@@ -330,7 +334,7 @@ export default function App() {
         </div>
         <div style={{display:'flex',gap:6,marginTop:10,overflowX:'auto',paddingBottom:2}}>
           {expiries.map(e=>(
-            <button key={e} onClick={()=>setExpiry(e)}
+            <button key={e} onClick={()=>{ expiryRef.current=e; setExpiry(e) }}
               style={{background:expiry===e?'#1d4ed8':'#1e2a3a',border:'none',borderRadius:4,color:expiry===e?'#fff':'#94a3b8',fontSize:10,padding:'5px 10px',cursor:'pointer',whiteSpace:'nowrap',fontFamily:'inherit'}}>
               {e}
             </button>
