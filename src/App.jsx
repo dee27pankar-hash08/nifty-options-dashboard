@@ -189,54 +189,50 @@ function calcLevels(side, ltp, delta, spot, a, candles, rows) {
   const intradayHigh = safe(()=>Math.max(...candles.slice(-2).map(c=>c[2])), null)
 
   if(side === 'ce') {
-    // SL: tighter of intraday low or PE wall
-    const slLevel = intradayLow
-      ? Math.max(intradayLow - 20, a.S)
-      : a.S
-    const niftySL = Math.round(slLevel)
+    // SL must always be BELOW spot — use intraday low or fallback to 0.5% below spot
+    const rawSL = intradayLow ? intradayLow - 20 : spot * 0.995
+    const niftySL = Math.round(Math.min(rawSL, spot - 30)) // always at least 30pts below
 
-    // Target: nearest CE wall ABOVE spot (not just a.R which may be below spot in strong trend)
+    // Target: heaviest CE wall above spot
     const ceAbove = safe(()=>{
-      const near = rows.filter(r => r.strike > spot)
-      if(!near.length) return a.R
-      return near.reduce((b,r) => r.ce_oi > b.ce_oi ? r : b, near[0]).strike
-    }, a.R)
+      const above = rows.filter(r => r.strike > spot)
+      if(!above.length) return spot + 300
+      return above.reduce((b,r) => r.ce_oi > b.ce_oi ? r : b, above[0]).strike
+    }, spot + 300)
     const niftyTGT = Math.round(ceAbove)
 
-    const niftySlDist  = Math.max(0, spot - niftySL)
+    const niftySlDist  = Math.max(30, spot - niftySL)
     const niftyTgtDist = Math.max(0, niftyTGT - spot)
     const optionEntry  = +ltp.toFixed(1)
-    const optionSL     = +(ltp - niftySlDist * absDelta).toFixed(1)
+    const optionSL     = Math.max(0.5, +(ltp - niftySlDist * absDelta).toFixed(1))
     const optionTGT    = +(ltp + niftyTgtDist * absDelta).toFixed(1)
-    const rr           = niftySlDist > 0 ? +(niftyTgtDist / niftySlDist).toFixed(1) : null
+    const rr           = +(niftyTgtDist / niftySlDist).toFixed(1)
 
     return { niftySL, niftyTGT, niftySlDist, niftyTgtDist,
-      optionEntry, optionSL: Math.max(0.5, optionSL), optionTGT, rr, side: 'ce' }
+      optionEntry, optionSL, optionTGT, rr, side: 'ce' }
 
   } else {
-    // SL: tighter of intraday high or CE wall
-    const slLevel = intradayHigh
-      ? Math.min(intradayHigh + 20, a.R)
-      : a.R
-    const niftySL = Math.round(slLevel)
+    // SL must always be ABOVE spot
+    const rawSL = intradayHigh ? intradayHigh + 20 : spot * 1.005
+    const niftySL = Math.round(Math.max(rawSL, spot + 30))
 
-    // Target: nearest PE wall BELOW spot
+    // Target: heaviest PE wall below spot
     const peBelow = safe(()=>{
-      const near = rows.filter(r => r.strike < spot)
-      if(!near.length) return a.S
-      return near.reduce((b,r) => r.pe_oi > b.pe_oi ? r : b, near[0]).strike
-    }, a.S)
+      const below = rows.filter(r => r.strike < spot)
+      if(!below.length) return spot - 300
+      return below.reduce((b,r) => r.pe_oi > b.pe_oi ? r : b, below[0]).strike
+    }, spot - 300)
     const niftyTGT = Math.round(peBelow)
 
-    const niftySlDist  = Math.max(0, niftySL - spot)
+    const niftySlDist  = Math.max(30, niftySL - spot)
     const niftyTgtDist = Math.max(0, spot - niftyTGT)
     const optionEntry  = +ltp.toFixed(1)
-    const optionSL     = +(ltp - niftySlDist * absDelta).toFixed(1)
+    const optionSL     = Math.max(0.5, +(ltp - niftySlDist * absDelta).toFixed(1))
     const optionTGT    = +(ltp + niftyTgtDist * absDelta).toFixed(1)
-    const rr           = niftySlDist > 0 ? +(niftyTgtDist / niftySlDist).toFixed(1) : null
+    const rr           = +(niftyTgtDist / niftySlDist).toFixed(1)
 
     return { niftySL, niftyTGT, niftySlDist, niftyTgtDist,
-      optionEntry, optionSL: Math.max(0.5, optionSL), optionTGT, rr, side: 'pe' }
+      optionEntry, optionSL, optionTGT, rr, side: 'pe' }
   }
 }
 
