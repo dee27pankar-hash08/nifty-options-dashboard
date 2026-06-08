@@ -43,7 +43,7 @@ export default async function handler(req, res) {
       headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' },
     });
     const data = await upstream.json();
-    res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=30');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     return res.status(upstream.status).json(data);
   } catch (err) {
     return res.status(502).json({ error: 'Upstream fetch failed', detail: err.message });
