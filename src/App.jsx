@@ -179,6 +179,12 @@ function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles) {
   else if(isTrend)regime='TRENDING'
   else if(isChannel)regime='CHANNELING'
 
+  // Time of day scoring
+  // 9:45-11:00 = prime (1.0), 11:00-14:00 = valid but later (0.7), outside = 0
+  let timeScore = 0.7  // default
+  if(mins>=9*60+45&&mins<=11*60) timeScore=1.0
+  else if(mins>14*60) timeScore=0  // after 2 PM no new trend entries
+
   return {
     bias,conv,score,reasons:ranked.map(x=>x.r),
     pcr,maxPain:mp,R,S,wallPos,wallZone,
@@ -186,7 +192,8 @@ function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles) {
     bld:{bull,bear,totalCe:tCe,totalPe:tPe},
     vixZone,timeWarning,trend,tLc,tPc,em,
     insidePDHL,tightRange,sustained,
-    dayRange:Math.round(dayRange),emRound:Math.round(em)
+    dayRange:Math.round(dayRange),emRound:Math.round(em),
+    timeScore
   }
 }
 
@@ -241,22 +248,33 @@ function calcLevels(side, ltp, delta, spot, a, candles, rows, isChannel) {
 }
 
 // ── RECOMMENDATION ────────────────────────────────────────────────────────────
-function getRec(rows, spot, a, vix, candles) {
+function getRec(rows, spot, a, vix, candles, belowPDLStreak=0) {
   if(!a) return {type:'No Trade',logic:'Analysis unavailable'}
-  const {bias,conv,timeWarning,nearSup,nearRes,isChannel,isTrend,regime}=a
+  const {bias,conv,timeWarning,nearSup,nearRes,isChannel,isTrend,regime,timeScore=0.7}=a
   if(timeWarning) return {type:'Wait',logic:timeWarning}
-  if(vix!=null&&vix>20) return {type:'No Trade',logic:`VIX ${vix.toFixed(1)} too high`}
+  if(vix!=null&&vix>20) return {type:'No Trade',logic:`VIX ${vix.toFixed(1)} too high — premiums too expensive`}
 
   const pick=(side)=>safe(()=>{
     const lt=`${side}_ltp`,dl=`${side}_delta`
-    const aff=rows.filter(r=>r[lt]*LOT<=BUDGET&&r[lt]>0.5).map(r=>({...r,_ad:Math.abs(r[dl])}))
+    const bk=`${side}_bid`,ak=`${side}_ask`
+    const aff=rows.filter(r=>r[lt]*LOT<=BUDGET&&r[lt]>0.5)
+      .map(r=>({...r,_ad:Math.abs(r[dl]),_spread:(r[ak]||0)-(r[bk]||0)}))
     if(!aff.length) return null
-    aff.sort((a,b)=>b._ad-a._ad||a[lt]-b[lt])
-    const row=aff[0],cost=row[lt]*LOT
-    const levels=calcLevels(side, row[lt], row[dl], spot, a, candles||[], rows, isChannel)
+    // Filter illiquid (spread>15) unless no choice
+    const liquid=aff.filter(r=>r._spread<=15)
+    const cand=liquid.length?liquid:aff
+    // Primary: highest delta. Secondary among similar delta (within 0.05): tightest spread
+    cand.sort((a,b)=>{
+      const dd=b._ad-a._ad
+      if(Math.abs(dd)>0.05) return dd
+      return a._spread-b._spread
+    })
+    const row=cand[0],cost=row[lt]*LOT
+    const spread=+row._spread.toFixed(1)
     return {strike:row.strike,ltp:row[lt],delta:row[dl],theta:row[`${side}_theta`],iv:row[`${side}_iv`],
       cost,lots:Math.floor(BUDGET/cost),moneyness:Math.round(side==='ce'?spot-row.strike:row.strike-spot),
-      lowQ:Math.abs(row[dl])<0.30, levels}
+      lowQ:Math.abs(row[dl])<0.30,spread,spreadWide:spread>8,
+      levels:calcLevels(side,row[lt],row[dl],spot,a,candles||[],rows,isChannel)}
   })
 
   if(isChannel){
@@ -266,17 +284,25 @@ function getRec(rows, spot, a, vix, candles) {
   }
 
   if(isTrend){
-    // In a clear trend, the regime IS the signal — bypass conviction gating
-    // TRENDING DOWN (broke below PDL) → PE Buy
-    // TRENDING UP (broke above PDH) → CE Buy
-    // Generic TRENDING (sustained candles) → use bias if any, else trade trend direction
+    // After 2 PM — no new trend entries (theta too costly)
+    if(timeScore===0) return{type:'No Trade',logic:'TREND MODE: After 2 PM — no new trend entries. Theta risk too high.'}
+
+    // False breakdown protection — needs 2 consecutive refreshes below PDL
+    const confirmed = belowPDLStreak>=2
+    const breakdownNote = regime==='TRENDING DOWN'
+      ? (confirmed?' ✓ Confirmed (2+ refreshes below PDL).' : ` ⚠ Unconfirmed — breakdown needs 1 more refresh to confirm. (${belowPDLStreak}/2)`)
+      : ''
+    const timeNote = timeScore<1.0 ? ' Later entry window (post 11 AM) — consider smaller size.' : ''
+
     if(regime==='TRENDING DOWN'||(regime==='TRENDING'&&bias.includes('BEAR'))){
       const d=pick('pe')
-      return{type:'PE Buy',...d,logic:`TREND MODE (${regime}): Bearish — ride the downtrend. SL above recent swing high.`}
+      return{type:'PE Buy',...d,confirmed,
+        logic:`TREND (${regime}): Bearish.${breakdownNote}${timeNote}`}
     }
     if(regime==='TRENDING UP'||(regime==='TRENDING'&&bias.includes('BULL'))){
       const d=pick('ce')
-      return{type:'CE Buy',...d,logic:`TREND MODE (${regime}): Bullish — ride the uptrend. SL below recent swing low.`}
+      return{type:'CE Buy',...d,confirmed:true,
+        logic:`TREND (${regime}): Bullish — ride the uptrend.${timeNote}`}
     }
     // Generic trend with no clear bias — stay out
     return{type:'No Trade',logic:`TREND MODE (${regime}): Direction unclear. Wait for confirmation.`}
@@ -310,6 +336,13 @@ export default function App() {
   const [updated,setUpdated] = useState(null)
   const [expiry, setExpiry]  = useState(null)
   const [expiries,setExpiries]= useState([])
+  const [showLog, setShowLog] = useState(false)
+  const [exitingId, setExitingId] = useState(null)
+  const [exitPrice, setExitPrice] = useState('')
+  const belowPDLRef = useRef(0)
+  const [tradeLog, setTradeLog] = useState(()=>{
+    try{return JSON.parse(localStorage.getItem('nifty_tradelog')||'[]')}catch{return[]}
+  })
 
   // Load expiries once
   useEffect(()=>{
@@ -349,12 +382,16 @@ export default function App() {
         ce_oi:s.call_options.market_data.oi||0,
         ce_prev_oi:s.call_options.market_data.prev_oi||0,
         ce_ltp:s.call_options.market_data.ltp||0,
+        ce_bid:s.call_options.market_data.bid_price||0,
+        ce_ask:s.call_options.market_data.ask_price||0,
         ce_iv:s.call_options.option_greeks.iv||0,
         ce_delta:s.call_options.option_greeks.delta||0,
         ce_theta:s.call_options.option_greeks.theta||0,
         pe_oi:s.put_options.market_data.oi||0,
         pe_prev_oi:s.put_options.market_data.prev_oi||0,
         pe_ltp:s.put_options.market_data.ltp||0,
+        pe_bid:s.put_options.market_data.bid_price||0,
+        pe_ask:s.put_options.market_data.ask_price||0,
         pe_iv:s.put_options.option_greeks.iv||0,
         pe_delta:s.put_options.option_greeks.delta||0,
         pe_theta:s.put_options.option_greeks.theta||0,
@@ -363,8 +400,13 @@ export default function App() {
       const near=rows.filter(r=>Math.abs(r.strike-spot)<=NTM)
       const ceW=[...near].sort((a,b)=>b.ce_oi-a.ce_oi).slice(0,3)
       const peW=[...near].sort((a,b)=>b.pe_oi-a.pe_oi).slice(0,3)
+
+      // Update false breakdown streak — needs 2 consecutive refreshes below PDL to confirm
+      if(pdl&&spot<pdl) belowPDLRef.current = belowPDLRef.current + 1
+      else belowPDLRef.current = 0
+
       const a=safe(()=>analyse(rows,spot,dte,oiData,vix,pdh,pdl,ic))
-      const rec=safe(()=>getRec(rows,spot,a,vix,ic),{type:'No Trade',logic:'Analysis error'})
+      const rec=safe(()=>getRec(rows,spot,a,vix,ic,belowPDLRef.current),{type:'No Trade',logic:'Analysis error'})
       setData({spot,rows,dte,ceW,peW,a,rec,vix,pdh,pdl})
       setUpdated(new Date())
     }).catch(e=>setErr(String(e?.message||e)))
@@ -376,6 +418,43 @@ export default function App() {
     const t=setInterval(()=>{ if(isOpen()) setTick(c=>c+1) },15*60*1000)
     return()=>clearInterval(t)
   },[])
+
+  const logEntry = () => {
+    if(!data?.rec||!['CE Buy','PE Buy'].includes(data.rec.type)) return
+    const entry = {
+      id: Date.now(),
+      date: new Date().toLocaleDateString('en-IN'),
+      time: new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Kolkata'}),
+      regime: data.a?.regime||'—',
+      signal: data.rec.type,
+      strike: data.rec.strike,
+      entryLTP: data.rec.ltp,
+      sl: data.rec.levels?.optionSL,
+      target: data.rec.levels?.optionTGT,
+      rr: data.rec.levels?.rr,
+      spread: data.rec.spread,
+      confirmed: data.rec.confirmed,
+      spot: data.spot,
+      exitPrice: null, pnl: null
+    }
+    const newLog = [entry,...tradeLog].slice(0,30)
+    setTradeLog(newLog)
+    try{localStorage.setItem('nifty_tradelog',JSON.stringify(newLog))}catch{}
+  }
+
+  const logExit = (id) => {
+    const price = parseFloat(exitPrice)
+    if(isNaN(price)||price<=0) return
+    const updated2 = tradeLog.map(t=>{
+      if(t.id!==id) return t
+      const dir = t.signal==='CE Buy'?1:-1
+      const pnl = Math.round((price-t.entryLTP)*dir*LOT)
+      return {...t,exitPrice:price,pnl}
+    })
+    setTradeLog(updated2)
+    try{localStorage.setItem('nifty_tradelog',JSON.stringify(updated2))}catch{}
+    setExitingId(null); setExitPrice('')
+  }
 
   const a=data?.a
   const bias=a?.bias||'NEUTRAL'
@@ -528,7 +607,10 @@ export default function App() {
                 <div style={{fontSize:16,fontWeight:700}}>{data.rec.lots} lot{data.rec.lots>1?'s':''}</div>
               </div>}
             </div>
-            {data.rec.ltp&&<div style={{marginTop:8,fontSize:11,color:'#475569'}}>LTP ₹{data.rec.ltp} · Δ {Math.abs(data.rec.delta||0).toFixed(2)} · {Math.abs(data.rec.moneyness||0)} pts {(data.rec.moneyness||0)>=0?'ITM':'OTM'} · θ {(data.rec.theta||0).toFixed(0)}/day · IV {(data.rec.iv||0).toFixed(0)}</div>}
+            {data.rec.ltp&&<div style={{marginTop:8,fontSize:11,color:'#475569'}}>
+              LTP ₹{data.rec.ltp} · Δ {Math.abs(data.rec.delta||0).toFixed(2)} · {Math.abs(data.rec.moneyness||0)} pts {(data.rec.moneyness||0)>=0?'ITM':'OTM'} · θ {(data.rec.theta||0).toFixed(0)}/day · IV {(data.rec.iv||0).toFixed(0)}
+              {data.rec.spread!=null&&<span style={{marginLeft:8,color:data.rec.spreadWide?'#fb923c':'#64748b'}}>· Spread ₹{data.rec.spread}{data.rec.spreadWide?' ⚠':''}</span>}
+            </div>}
 
             {/* Entry / SL / Target levels */}
             {data.rec.levels&&(()=>{
@@ -561,6 +643,12 @@ export default function App() {
             <div style={{marginTop:8,fontSize:11,color:'#475569',fontStyle:'italic'}}>{data.rec.logic}</div>
             {data.rec.lowQ&&<div style={{marginTop:6,fontSize:11,color:'#fb923c'}}>⚠ Far-OTM only within budget</div>}
             {data.dte<=2&&!['No Trade','Wait'].includes(data.rec.type)&&<div style={{marginTop:6,fontSize:11,color:'#fb923c'}}>⚠ {data.dte}d to expiry — steep theta</div>}
+            {['CE Buy','PE Buy'].includes(data.rec.type)&&(
+              <button onClick={logEntry}
+                style={{marginTop:12,width:'100%',padding:'10px',background:'#1e3a5f',border:'1px solid #3b82f6',borderRadius:6,color:'#60a5fa',fontSize:12,fontWeight:700,cursor:'pointer',fontFamily:'inherit'}}>
+                📝 Log Entry at ₹{data.rec.ltp}
+              </button>
+            )}
           </div>
         )}
 
@@ -584,6 +672,65 @@ export default function App() {
             </div>
           </div>
         )}
+        {/* Trade Log */}
+        <div style={{margin:'10px 12px 0',background:'#0d1117',borderRadius:12,border:'1px solid #1e2a3a',overflow:'hidden'}}>
+          <div onClick={()=>setShowLog(s=>!s)}
+            style={{padding:'12px 16px',cursor:'pointer',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+            <div style={{fontSize:11,fontWeight:700,color:'#475569'}}>TRADE LOG ({tradeLog.length})</div>
+            <div style={{fontSize:11,color:'#334155'}}>{showLog?'▲':'▼'}</div>
+          </div>
+          {showLog&&(
+            <div style={{borderTop:'1px solid #1e2a3a',padding:'8px 12px'}}>
+              {tradeLog.length===0&&<div style={{fontSize:11,color:'#334155',padding:'8px 0'}}>No trades logged yet. Hit "Log Entry" when a CE/PE Buy is active.</div>}
+              {tradeLog.map(t=>(
+                <div key={t.id} style={{padding:'10px 0',borderBottom:'1px solid #0f172a'}}>
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
+                    <div>
+                      <span style={{fontSize:11,fontWeight:700,color:RC[t.signal]||'#fff'}}>{t.signal}</span>
+                      <span style={{fontSize:11,color:'#64748b',marginLeft:8}}>{t.strike}{t.signal==='CE Buy'?'C':'P'}</span>
+                      <span style={{fontSize:10,color:'#334155',marginLeft:8}}>{t.regime}</span>
+                      {t.confirmed===false&&<span style={{fontSize:9,color:'#fb923c',marginLeft:6}}>UNCONFIRMED</span>}
+                    </div>
+                    <div style={{fontSize:10,color:'#475569'}}>{t.time} {t.date}</div>
+                  </div>
+                  <div style={{fontSize:11,color:'#475569',marginTop:4}}>
+                    Entry ₹{t.entryLTP} · SL ₹{t.sl} · TGT ₹{t.target} · R:R {t.rr}
+                    {t.spread&&<span style={{marginLeft:6,color:t.spread>8?'#fb923c':'#475569'}}>· Spread ₹{t.spread}</span>}
+                  </div>
+                  {t.pnl!=null?(
+                    <div style={{marginTop:4,fontSize:12,fontWeight:700,color:t.pnl>=0?'#22c55e':'#ef4444'}}>
+                      Exit ₹{t.exitPrice} → {t.pnl>=0?'+':''}₹{t.pnl}
+                    </div>
+                  ):(
+                    exitingId===t.id?(
+                      <div style={{marginTop:6,display:'flex',gap:6}}>
+                        <input
+                          type="number" placeholder="Exit price"
+                          value={exitPrice}
+                          onChange={e=>setExitPrice(e.target.value)}
+                          style={{flex:1,background:'#1e2a3a',border:'1px solid #334155',borderRadius:4,color:'#fff',padding:'6px 8px',fontSize:12,fontFamily:'inherit'}}/>
+                        <button onClick={()=>logExit(t.id)}
+                          style={{background:'#22c55e',border:'none',borderRadius:4,color:'#000',padding:'6px 12px',fontSize:12,fontWeight:700,cursor:'pointer'}}>
+                          Save
+                        </button>
+                        <button onClick={()=>{setExitingId(null);setExitPrice('')}}
+                          style={{background:'#1e2a3a',border:'1px solid #334155',borderRadius:4,color:'#64748b',padding:'6px 10px',fontSize:12,cursor:'pointer'}}>
+                          ✕
+                        </button>
+                      </div>
+                    ):(
+                      <button onClick={()=>{setExitingId(t.id);setExitPrice('')}}
+                        style={{marginTop:6,background:'#1c1400',border:'1px solid #92400e',borderRadius:4,color:'#fbbf24',padding:'4px 10px',fontSize:11,cursor:'pointer',fontFamily:'inherit'}}>
+                        📝 Log Exit
+                      </button>
+                    )
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
         <div style={{margin:'16px 12px 0',fontSize:10,color:'#1e2a3a',textAlign:'center'}}>Refreshes every 15 min · Positioning-based, not financial advice</div>
       </>)}
     </div>
