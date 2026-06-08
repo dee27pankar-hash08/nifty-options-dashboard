@@ -2,7 +2,6 @@
 // Keeps the Analytics Token server-side, never exposed to browser
 
 export default async function handler(req, res) {
-  // CORS — allow requests from any origin (your Vercel frontend)
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -14,21 +13,31 @@ export default async function handler(req, res) {
   const { endpoint, ...params } = req.query;
   if (!endpoint) return res.status(400).json({ error: 'endpoint param required' });
 
-  // Whitelist of allowed Upstox endpoints
   const ALLOWED = {
-    'option-chain':  'https://api.upstox.com/v2/option/chain',
+    'option-chain':    'https://api.upstox.com/v2/option/chain',
     'option-contract': 'https://api.upstox.com/v2/option/contract',
-    'change-oi':     'https://api.upstox.com/v2/market/change-oi',
-    'max-pain':      'https://api.upstox.com/v2/market/max-pain',
-    'pcr':           'https://api.upstox.com/v2/market/pcr',
+    'change-oi':       'https://api.upstox.com/v2/market/change-oi',
+    'max-pain':        'https://api.upstox.com/v2/market/max-pain',
+    'pcr':             'https://api.upstox.com/v2/market/pcr',
+    'ohlc':            'https://api.upstox.com/v2/market-quote/ohlc',
+    'intraday':        'https://api.upstox.com/v2/historical-candle/intraday/NSE_INDEX%7CNifty+50/30minute',
+    'vix-intraday':    'https://api.upstox.com/v2/historical-candle/intraday/NSE_INDEX%7CIndia+VIX/30minute',
+    'historical':      null, // built dynamically below
   };
 
-  const baseUrl = ALLOWED[endpoint];
-  if (!baseUrl) return res.status(400).json({ error: `Unknown endpoint: ${endpoint}` });
+  let url;
 
-  // Build query string from remaining params
-  const qs = new URLSearchParams(params).toString();
-  const url = qs ? `${baseUrl}?${qs}` : baseUrl;
+  // Historical candle needs instrument + interval + dates in the path
+  if (endpoint === 'historical') {
+    const { instrument_key, interval, to_date, from_date } = params;
+    const key = encodeURIComponent(instrument_key);
+    url = `https://api.upstox.com/v2/historical-candle/${key}/${interval}/${to_date}/${from_date}`;
+  } else {
+    const baseUrl = ALLOWED[endpoint];
+    if (!baseUrl) return res.status(400).json({ error: `Unknown endpoint: ${endpoint}` });
+    const qs = new URLSearchParams(params).toString();
+    url = qs ? `${baseUrl}?${qs}` : baseUrl;
+  }
 
   try {
     const upstream = await fetch(url, {
