@@ -241,9 +241,14 @@ export default function App() {
 
   const fetchData = useCallback(async (selectedExpiry) => {
     if (!selectedExpiry) return
-    setLoading(true); setError(null)
+    setLoading(true)
+    setError(null)
+
+    // Safety net — loading never stuck more than 20 seconds
+    const safetyTimer = setTimeout(() => setLoading(false), 20000)
+
     try {
-      // For PDH/PDL: get last 3 days of daily candles to handle weekends
+      // For PDH/PDL: get last 5 days of daily candles to handle weekends
       const to = todayStr()
       const from = (() => { const d = new Date(); d.setDate(d.getDate() - 5); return d.toISOString().split('T')[0] })()
 
@@ -303,9 +308,15 @@ export default function App() {
       const rec = getRecommendation(rows, spot, analysis.bias, analysis.conviction, vix, analysis.trendCtx.timeWarning)
 
       setData({ spot, rows, dte, em, ceWalls, peWalls, analysis, rec, vix, pdh, pdl, candles })
-      setLastUpdate(new Date()); setMarketOpen(isMarketOpen())
-    } catch (e) { setError(e.message) }
-    finally { setLoading(false) }
+      setLastUpdate(new Date())
+      setMarketOpen(isMarketOpen())
+    } catch (e) {
+      console.error('fetchData error:', e)
+      setError(e.message || 'Unknown error — check console')
+    } finally {
+      clearTimeout(safetyTimer)
+      setLoading(false)
+    }
   }, [])
 
   useEffect(() => {
@@ -348,9 +359,9 @@ export default function App() {
             <div style={{ fontFamily:"'Syne', sans-serif", fontWeight:800, fontSize:22, color:'#f8fafc' }}>
               {data ? `₹${data.spot.toLocaleString('en-IN', { minimumFractionDigits:2 })}` : '—'}
             </div>
-            <button onClick={() => expiry && fetchData(expiry)} disabled={loading}
+            <button onClick={() => { setError(null); expiry && fetchData(expiry) }} disabled={loading}
               style={{ background: loading?'#1e2a3a':'#1d4ed8', border:'none', borderRadius:4, color:'#fff', fontSize:10, padding:'3px 10px', cursor: loading?'default':'pointer', fontFamily:'inherit', marginTop:2 }}>
-              {loading ? 'REFRESHING...' : '↻ REFRESH'}
+              {loading ? 'LOADING...' : '↻ REFRESH'}
             </button>
           </div>
         </div>
