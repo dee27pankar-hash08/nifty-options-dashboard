@@ -243,10 +243,14 @@ export default function App() {
     if (!selectedExpiry) return
     setLoading(true); setError(null)
     try {
-      const [chainRes, changeOiRes, ohlcRes, intradayRes, vixRes] = await Promise.allSettled([
+      // For PDH/PDL: get last 3 days of daily candles to handle weekends
+      const to = todayStr()
+      const from = (() => { const d = new Date(); d.setDate(d.getDate() - 5); return d.toISOString().split('T')[0] })()
+
+      const [chainRes, changeOiRes, historicalRes, intradayRes, vixRes] = await Promise.allSettled([
         api('option-chain', { instrument_key: 'NSE_INDEX|Nifty 50', expiry_date: selectedExpiry }),
         api('change-oi', { instrument_key: 'NSE_INDEX|Nifty 50', expiry: selectedExpiry, date: todayStr(), interval: 1 }),
-        api('ohlc', { instrument_key: 'NSE_INDEX|Nifty 50', interval: '1d' }),
+        api('historical', { to_date: to, from_date: from }),
         api('intraday'),
         api('vix-intraday'),
       ])
@@ -256,11 +260,15 @@ export default function App() {
       const spot = chain[0].underlying_spot_price
       const changeOiData = changeOiRes.status === 'fulfilled' ? changeOiRes.value.data : null
 
-      // PDH / PDL from OHLC
+      // PDH/PDL from historical daily — take the most recent completed candle (yesterday)
       let pdh = null, pdl = null
-      if (ohlcRes.status === 'fulfilled') {
-        const ohlcData = ohlcRes.value?.data?.['NSE_INDEX|Nifty 50']
-        if (ohlcData?.ohlc) { pdh = ohlcData.ohlc.high; pdl = ohlcData.ohlc.low }
+      if (historicalRes.status === 'fulfilled') {
+        const candles = historicalRes.value?.data?.candles
+        if (candles?.length) {
+          // candles sorted newest first — [ts, o, h, l, c, v, oi]
+          const prev = candles[0]
+          pdh = prev[2]; pdl = prev[3]
+        }
       }
 
       // Intraday 30min candles for trend
