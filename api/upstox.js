@@ -1,6 +1,3 @@
-// Vercel serverless function — proxies all Upstox API calls
-// Keeps the Analytics Token server-side, never exposed to browser
-
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -13,25 +10,27 @@ export default async function handler(req, res) {
   const { endpoint, ...params } = req.query;
   if (!endpoint) return res.status(400).json({ error: 'endpoint param required' });
 
+  // Note: instrument keys with spaces need %20 in path (not +)
+  const NIFTY   = 'NSE_INDEX%7CNifty%2050';
+  const VIX_KEY = 'NSE_INDEX%7CIndia%20VIX';
+
   const ALLOWED = {
-    'option-chain':    'https://api.upstox.com/v2/option/chain',
-    'option-contract': 'https://api.upstox.com/v2/option/contract',
-    'change-oi':       'https://api.upstox.com/v2/market/change-oi',
-    'max-pain':        'https://api.upstox.com/v2/market/max-pain',
-    'pcr':             'https://api.upstox.com/v2/market/pcr',
-    'ohlc':            'https://api.upstox.com/v2/market-quote/ohlc',
-    'intraday':        'https://api.upstox.com/v2/historical-candle/intraday/NSE_INDEX%7CNifty+50/30minute',
-    'vix-intraday':    'https://api.upstox.com/v2/historical-candle/intraday/NSE_INDEX%7CIndia+VIX/30minute',
-    'historical':      null, // built dynamically below
+    'option-chain':    `https://api.upstox.com/v2/option/chain`,
+    'option-contract': `https://api.upstox.com/v2/option/contract`,
+    'change-oi':       `https://api.upstox.com/v2/market/change-oi`,
+    'max-pain':        `https://api.upstox.com/v2/market/max-pain`,
+    'pcr':             `https://api.upstox.com/v2/market/pcr`,
+    // Intraday 30min candles — instrument key in path, must use %20
+    'intraday':        `https://api.upstox.com/v2/historical-candle/intraday/${NIFTY}/30minute`,
+    'vix-intraday':    `https://api.upstox.com/v2/historical-candle/intraday/${VIX_KEY}/30minute`,
   };
 
   let url;
 
-  // Historical candle needs instrument + interval + dates in the path
   if (endpoint === 'historical') {
-    const { instrument_key, interval, to_date, from_date } = params;
-    const key = encodeURIComponent(instrument_key);
-    url = `https://api.upstox.com/v2/historical-candle/${key}/${interval}/${to_date}/${from_date}`;
+    // PDH/PDL: daily candle, instrument key in path
+    const { to_date, from_date } = params;
+    url = `https://api.upstox.com/v2/historical-candle/${NIFTY}/day/${to_date}/${from_date}`;
   } else {
     const baseUrl = ALLOWED[endpoint];
     if (!baseUrl) return res.status(400).json({ error: `Unknown endpoint: ${endpoint}` });
@@ -41,10 +40,7 @@ export default async function handler(req, res) {
 
   try {
     const upstream = await fetch(url, {
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Accept': 'application/json',
-      },
+      headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' },
     });
     const data = await upstream.json();
     res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=30');
