@@ -263,11 +263,18 @@ function calcLevels(side, ltp, delta, spot, a, candles, rows, isChannel) {
   }
 
   const slDist = side === 'ce' ? Math.max(30, spot - niftySL) : Math.max(30, niftySL - spot)
+  // Cap SL distance on expiry/near-expiry day to prevent absurd SLs from wide candle ranges
+  const maxSlDist = a.emRound > 0
+    ? Math.min(slDist, Math.max(40, a.emRound * 0.35))  // max 35% of expected move
+    : slDist
   const tgtDist = side === 'ce' ? Math.max(0, niftyTGT - spot) : Math.max(0, spot - niftyTGT)
   const optionEntry = +ltp.toFixed(1)
-  const optionSL = Math.max(0.5, +(ltp - slDist * absDelta).toFixed(1))
+  // SL: tighter of calculated OR 35% max loss from entry (never wipe the premium)
+  const calcSL = +(ltp - maxSlDist * absDelta).toFixed(1)
+  const premiumFloor = +(ltp * 0.65).toFixed(1)   // SL at most 35% below entry
+  const optionSL = Math.max(premiumFloor, Math.max(0.5, calcSL))
   const optionTGT = +(ltp + tgtDist * absDelta).toFixed(1)
-  const rr = slDist > 0 ? +(tgtDist / slDist).toFixed(1) : 0
+  const rr = (ltp - optionSL) > 0 ? +((optionTGT - ltp) / (ltp - optionSL)).toFixed(1) : 0
 
   return { optionEntry, optionSL, optionTGT, rr }
 }
