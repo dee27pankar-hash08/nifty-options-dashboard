@@ -118,7 +118,7 @@ function getTrend(candles, spot) {
 }
 
 // ── ANALYSIS ──────────────────────────────────────────────────────────────────
-function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles) {
+function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles, prevClose, prev2Close) {
   const near = rows.filter(r => Math.abs(r.strike - spot) <= NTM)
   if (!near.length) return null
 
@@ -131,6 +131,24 @@ function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles) {
   const pdhl = sigPDHL(spot, pdh, pdl)
   const tctx = getTrend(candles, spot)
 
+  // Prior-day context signal
+  // Captures multi-day trend the intraday signals miss
+  // Gap down from prev close = bearish, gap up = bullish
+  // Yesterday itself down vs day before = additional bearish weight
+  let priorV = 0, priorReason = 'Prior day context — no data'
+  if (prevClose && prevClose > 0) {
+    const gapPct = (spot - prevClose) / prevClose       // today's gap from yesterday's close
+    const prevDayChg = prev2Close ? (prevClose - prev2Close) / prev2Close : 0
+    // Gap signal: >0.3% gap = meaningful
+    const gapVote = clip(gapPct / 0.003)                // ±0.3% = full vote
+    // Prior day direction: was yesterday itself up or down
+    const prevDayVote = clip(prevDayChg / 0.003) * 0.5 // half weight
+    priorV = clip(gapVote * 0.7 + prevDayVote * 0.3)
+    const gapDir = gapPct < -0.003 ? 'gap down (bearish)' : gapPct > 0.003 ? 'gap up (bullish)' : 'flat open'
+    const prevDir = prevDayChg < -0.002 ? 'yesterday bearish' : prevDayChg > 0.002 ? 'yesterday bullish' : 'yesterday flat'
+    priorReason = `Prior context: ${gapDir} (${(gapPct * 100).toFixed(2)}%) · ${prevDir}`
+  }
+
   const sigs = [
     { v: pcr.vote, w: 2.0, r: pcr.reason },
     { v: bld.vote, w: 1.5, r: bld.reason },
@@ -140,6 +158,7 @@ function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles) {
     { v: vixS.vote, w: 1.0, r: vixS.reason },
     { v: pdhl.vote, w: 1.5, r: pdhl.reason },
     { v: tctx.trendVote, w: 0.8, r: `30min trend ${tctx.trend} (${tctx.lc ? tctx.lc.toFixed(0) : '—'} vs ${tctx.pc ? tctx.pc.toFixed(0) : '—'})` },
+    { v: priorV, w: 2.0, r: priorReason },   // prior-day context — high weight, captures what intraday misses
   ]
 
   const wsum = sigs.reduce((s, x) => s + x.w, 0)
@@ -203,7 +222,7 @@ function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles) {
     timeWarning: tctx.timeWarning, trend: tctx.trend, tLc: tctx.lc, tPc: tctx.pc,
     em, emRound: Math.round(em),
     insidePDHL, tightRange, sustained,
-    dayRange: Math.round(dayRange), timeScore
+    dayRange: Math.round(dayRange), timeScore, priorV
   }
 }
 
@@ -307,6 +326,17 @@ function getRec(rows, spot, a, vix, candles, belowPDLStreak) {
       const d = pick('ce')
       return { type: 'CE Buy', ...d, confirmed: true, logic: `TREND (${regime}): Bullish.${timeNote}` }
     }
+    // Generic TRENDING with neutral bias — use prior-day context to break the tie
+    if (regime === 'TRENDING') {
+      if (a.priorV <= -0.3) {
+        const d = pick('pe')
+        return { type: 'PE Buy', ...d, confirmed, logic: `TREND: Prior day bearish context — gap/close confirms downside.${timeNote}` }
+      }
+      if (a.priorV >= 0.3) {
+        const d = pick('ce')
+        return { type: 'CE Buy', ...d, confirmed: true, logic: `TREND: Prior day bullish context — gap/close confirms upside.${timeNote}` }
+      }
+    }
     return { type: 'No Trade', logic: `TREND MODE (${regime}): Direction unclear. Wait for confirmation.` }
   }
 
@@ -375,6 +405,9 @@ export default function App() {
       const hc = r3.status === 'fulfilled' ? safe(() => r3.value.data?.candles || [], []) : []
       const pdh = hc.length ? safe(() => hc[0][2]) : null
       const pdl = hc.length ? safe(() => hc[0][3]) : null
+      // Prior day context: yesterday close + day before close for multi-day trend
+      const prevClose = hc.length ? safe(() => hc[0][4]) : null
+      const prev2Close = hc.length >= 2 ? safe(() => hc[1][4]) : null
       const ic = r4.status === 'fulfilled' ? safe(() => r4.value.data?.candles || null) : null
       const vc = r5.status === 'fulfilled' ? safe(() => r5.value.data?.candles || [], []) : []
       const vix = vc.length ? safe(() => vc[vc.length - 1][4]) : null
@@ -408,9 +441,9 @@ export default function App() {
       if (pdl && spot < pdl) belowPDLRef.current = belowPDLRef.current + 1
       else belowPDLRef.current = 0
 
-      const a = safe(() => analyse(rows, spot, dte, oiData, vix, pdh, pdl, ic))
+      const a = safe(() => analyse(rows, spot, dte, oiData, vix, pdh, pdl, ic, prevClose, prev2Close))
       const rec = safe(() => getRec(rows, spot, a, vix, ic, belowPDLRef.current), { type: 'No Trade', logic: 'Analysis error' })
-      setData({ spot, rows, dte, ceW, peW, a, rec, vix, pdh, pdl })
+      setData({ spot, rows, dte, ceW, peW, a, rec, vix, pdh, pdl, prevClose, prev2Close })
       setUpdated(new Date())
     }).catch(e => setErr(String(e?.message || e)))
       .finally(() => setLoading(false))
