@@ -505,8 +505,7 @@ export default function App() {
     if (isNaN(price) || price <= 0) return
     const newLog = tradeLog.map(t => {
       if (t.id !== id) return t
-      const dir = t.signal === 'CE Buy' ? 1 : -1
-      const pnl = Math.round((price - t.entryLTP) * dir * LOT)
+      const pnl = Math.round((price - t.entryLTP) * LOT)  // always long: exit - entry × lots
       return { ...t, exitPrice: price, pnl }
     })
     setTradeLog(newLog)
