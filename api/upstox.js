@@ -20,8 +20,8 @@ export default async function handler(req, res) {
     'change-oi':       `https://api.upstox.com/v2/market/change-oi`,
     'max-pain':        `https://api.upstox.com/v2/market/max-pain`,
     'pcr':             `https://api.upstox.com/v2/market/pcr`,
-    // Intraday 30min candles — instrument key in path, must use %20
     'intraday':        `https://api.upstox.com/v2/historical-candle/intraday/${NIFTY}/30minute`,
+    'intraday-5min':   `https://api.upstox.com/v2/historical-candle/intraday/${NIFTY}/5minute`,
     'vix-intraday':    `https://api.upstox.com/v2/historical-candle/intraday/${VIX_KEY}/30minute`,
   };
 
