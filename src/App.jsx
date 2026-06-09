@@ -137,16 +137,18 @@ function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles, prevClose, pre
   // Yesterday itself down vs day before = additional bearish weight
   let priorV = 0, priorReason = 'Prior day context — no data'
   if (prevClose && prevClose > 0) {
-    const gapPct = (spot - prevClose) / prevClose       // today's gap from yesterday's close
-    const prevDayChg = prev2Close ? (prevClose - prev2Close) / prev2Close : 0
-    // Gap signal: >0.3% gap = meaningful
-    const gapVote = clip(gapPct / 0.003)                // ±0.3% = full vote
-    // Prior day direction: was yesterday itself up or down
-    const prevDayVote = clip(prevDayChg / 0.003) * 0.5 // half weight
-    priorV = clip(gapVote * 0.7 + prevDayVote * 0.3)
-    const gapDir = gapPct < -0.003 ? 'gap down (bearish)' : gapPct > 0.003 ? 'gap up (bullish)' : 'flat open'
-    const prevDir = prevDayChg < -0.002 ? 'yesterday bearish' : prevDayChg > 0.002 ? 'yesterday bullish' : 'yesterday flat'
-    priorReason = `Prior context: ${gapDir} (${(gapPct * 100).toFixed(2)}%) · ${prevDir}`
+    const gapPct = (spot - prevClose) / prevClose          // today's open vs yesterday close
+    const prevDayChg = prev2Close ? (prevClose - prev2Close) / prev2Close : 0  // yesterday vs day before
+
+    // 2-day trend is the PRIMARY signal — captures sustained momentum the algo misses
+    // Today's gap is SECONDARY — often flat/noisy at open
+    const prevDayVote = clip(prevDayChg / 0.003)   // full vote at 0.3% move
+    const gapVote = clip(gapPct / 0.003)
+    priorV = clip(prevDayVote * 0.6 + gapVote * 0.4)
+
+    const gapDir = gapPct < -0.002 ? `gap down ${(gapPct * 100).toFixed(2)}%` : gapPct > 0.002 ? `gap up +${(gapPct * 100).toFixed(2)}%` : `flat open (${(gapPct * 100).toFixed(2)}%)`
+    const prevDir = prevDayChg < -0.002 ? `yesterday fell ${(prevDayChg * 100).toFixed(2)}%` : prevDayChg > 0.002 ? `yesterday rose +${(prevDayChg * 100).toFixed(2)}%` : 'yesterday flat'
+    priorReason = `Prior context: ${prevDir} · ${gapDir}`
   }
 
   const sigs = [
