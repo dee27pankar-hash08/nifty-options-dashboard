@@ -224,7 +224,7 @@ function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles, prevClose, pre
     timeWarning: tctx.timeWarning, trend: tctx.trend, tLc: tctx.lc, tPc: tctx.pc,
     em, emRound: Math.round(em),
     insidePDHL, tightRange, sustained,
-    dayRange: Math.round(dayRange), timeScore, priorV
+    dayRange: Math.round(dayRange), timeScore, priorV, oiData
   }
 }
 
@@ -279,8 +279,74 @@ function calcLevels(side, ltp, delta, spot, a, candles, rows, isChannel) {
   return { optionEntry, optionSL, optionTGT, rr }
 }
 
+// ── BOUNCE / REJECTION DETECTION (5-min candles) ─────────────────────────────
+// Checks for confirmed reversal at a key OI wall
+// Works on ALL regimes — pullbacks happen even in strong trends
+function detectReversal(spot, oiData, candles5, rows) {
+  if (!candles5 || candles5.length < 2) return null
+
+  const last  = candles5[candles5.length - 1]  // [ts, o, h, l, c, v, oi]
+  const prev  = candles5[candles5.length - 2]
+  const lOpen = last[1], lHigh = last[2], lLow = last[3], lClose = last[4]
+  const pLow  = prev[3], pHigh = prev[2]
+
+  // Find strongest PE wall (support) and CE wall (resistance) near spot
+  const nearRows = rows.filter(r => Math.abs(r.strike - spot) <= 600)
+  if (!nearRows.length) return null
+
+  const peWallRow = nearRows.reduce((b, r) => r.pe_oi > b.pe_oi ? r : b, nearRows[0])
+  const ceWallRow = nearRows.reduce((b, r) => r.ce_oi > b.ce_oi ? r : b, nearRows[0])
+  const peWall = peWallRow.strike
+  const ceWall = ceWallRow.strike
+
+  // Get OI change at wall from change-oi data
+  const getWallOIChg = (strike, side) => {
+    if (!oiData?.call_put_oi_data_list) return 0
+    const entry = oiData.call_put_oi_data_list.find(s => s.strike_price === strike)
+    return entry ? (side === 'pe' ? entry.put_change_oi : entry.call_change_oi) : 0
+  }
+
+  // ── BOUNCE at PE wall (CE Buy opportunity) ───────────────────────────────
+  // Conditions: touched wall, closed above it, higher low, PE writers defending
+  const touchedPEWall = Math.abs(lLow - peWall) <= 50 || lLow <= peWall + 30
+  const closedAbovePEWall = lClose > peWall
+  const higherLow = lLow >= pLow - 10          // low held or improved (small buffer)
+  const peWritersDefending = getWallOIChg(peWall, 'pe') > 0
+
+  if (touchedPEWall && closedAbovePEWall && higherLow) {
+    const strength = peWritersDefending ? 'strong' : 'moderate'
+    return {
+      type: 'BOUNCE',
+      side: 'ce',
+      wall: peWall,
+      strength,
+      reason: `5-min bounce off PE wall ${peWall} — closed above (${lClose.toFixed(0)}), higher low held${peWritersDefending ? ', PE writers defending' : ''}`,
+    }
+  }
+
+  // ── REJECTION at CE wall (PE Buy opportunity) ────────────────────────────
+  // Conditions: touched wall, closed below it, lower high, CE writers defending
+  const touchedCEWall = Math.abs(lHigh - ceWall) <= 50 || lHigh >= ceWall - 30
+  const closedBelowCEWall = lClose < ceWall
+  const lowerHigh = lHigh <= pHigh + 10        // high failed to extend (small buffer)
+  const ceWritersDefending = getWallOIChg(ceWall, 'ce') > 0
+
+  if (touchedCEWall && closedBelowCEWall && lowerHigh) {
+    const strength = ceWritersDefending ? 'strong' : 'moderate'
+    return {
+      type: 'REJECTION',
+      side: 'pe',
+      wall: ceWall,
+      strength,
+      reason: `5-min rejection at CE wall ${ceWall} — closed below (${lClose.toFixed(0)}), lower high confirmed${ceWritersDefending ? ', CE writers defending' : ''}`,
+    }
+  }
+
+  return null
+}
+
 // ── RECOMMENDATION ────────────────────────────────────────────────────────────
-function getRec(rows, spot, a, vix, candles, belowPDLStreak) {
+function getRec(rows, spot, a, vix, candles5, belowPDLStreak) {
   if (!a) return { type: 'No Trade', logic: 'Analysis unavailable' }
   const { bias, conv, timeWarning, nearSup, nearRes, isChannel, isTrend, regime, timeScore } = a
   if (timeWarning) return { type: 'Wait', logic: timeWarning }
@@ -304,7 +370,7 @@ function getRec(rows, spot, a, vix, candles, belowPDLStreak) {
     })
     const row = cand[0], cost = row[lt] * LOT
     const spread = +row._sp.toFixed(1)
-    const levels = calcLevels(side, row[lt], row[dl], spot, a, candles || [], rows, isChannel)
+    const levels = calcLevels(side, row[lt], row[dl], spot, a, candles5 || [], rows, isChannel)
     return {
       strike: row.strike, ltp: row[lt], delta: row[dl],
       theta: row[`${side}_theta`], iv: row[`${side}_iv`],
@@ -314,6 +380,25 @@ function getRec(rows, spot, a, vix, candles, belowPDLStreak) {
     }
   })
 
+  // ── REVERSAL CHECK (runs first — works on ALL regimes) ────────────────────
+  // 5-min bounce/rejection at OI walls takes priority over broader regime signal
+  // This catches pullbacks on trend days AND channel reversals
+  if (vix == null || vix <= 18) {
+    const reversal = safe(() => detectReversal(spot, a.oiData, candles5, rows))
+    if (reversal) {
+      const d = pick(reversal.side)
+      const isStrong = reversal.strength === 'strong'
+      return {
+        type: reversal.side === 'ce' ? 'CE Buy' : 'PE Buy',
+        ...d,
+        confirmed: isStrong,
+        isReversal: true,
+        reversalType: reversal.type,
+        logic: `REVERSAL (${reversal.strength.toUpperCase()}): ${reversal.reason}`,
+      }
+    }
+  }
+
   if (isChannel) {
     if (nearSup) { const d = pick('ce'); return { type: 'CE Buy', ...d, logic: `CHANNEL: Near support (${a.S}) — bounce setup.${vix > 16 ? ' VIX elevated, size small.' : ''}` } }
     if (nearRes) { const d = pick('pe'); return { type: 'PE Buy', ...d, logic: `CHANNEL: Near resistance (${a.R}) — rejection setup.${vix > 16 ? ' VIX elevated, size small.' : ''}` } }
@@ -322,28 +407,45 @@ function getRec(rows, spot, a, vix, candles, belowPDLStreak) {
 
   if (isTrend) {
     if (timeScore === 0) return { type: 'No Trade', logic: 'TREND MODE: After 2 PM IST — no new trend entries. Theta risk too high.' }
-    const confirmed = streak >= 2
-    const timeNote = timeScore < 1.0 ? ' Post 11 AM entry — consider smaller size.' : ''
-    const bdNote = regime === 'TRENDING DOWN'
-      ? (confirmed ? ' ✓ Confirmed (2+ refreshes below PDL).' : ` ⚠ Unconfirmed breakdown (${streak}/2 refreshes).`)
-      : ''
+
+    // Price-based confirmation — instant, no waiting for refreshes
+    // Confirmed breakdown: nearest CE wall 30+ pts ABOVE spot (writers stepped back = breakdown is real)
+    // Confirmed breakout: nearest PE wall 30+ pts BELOW spot
+    const nearestCeAbove = safe(() => {
+      const ab = rows.filter(r => r.strike >= spot)
+      return ab.length ? ab.reduce((b, r) => r.ce_oi > b.ce_oi ? r : b, ab[0]).strike : null
+    }, null)
+    const nearestPeBelow = safe(() => {
+      const bl = rows.filter(r => r.strike <= spot)
+      return bl.length ? bl.reduce((b, r) => r.pe_oi > b.pe_oi ? r : b, bl[0]).strike : null
+    }, null)
+    const ceWallGap = nearestCeAbove != null ? nearestCeAbove - spot : 0
+    const peWallGap = nearestPeBelow != null ? spot - nearestPeBelow : 0
+    const timeNote = timeScore < 1.0 ? ' Post 11 AM — consider smaller size.' : ''
+
     if (regime === 'TRENDING DOWN' || (regime === 'TRENDING' && bias.includes('BEAR'))) {
+      const confirmed = ceWallGap >= 30
+      const bdNote = confirmed
+        ? ` ✓ Confirmed — CE wall ${Math.round(ceWallGap)} pts above spot.`
+        : ` ⚠ Unconfirmed — CE wall only ${Math.round(ceWallGap)} pts above, bounce risk.`
       const d = pick('pe')
       return { type: 'PE Buy', ...d, confirmed, logic: `TREND (${regime}): Bearish.${bdNote}${timeNote}` }
     }
     if (regime === 'TRENDING UP' || (regime === 'TRENDING' && bias.includes('BULL'))) {
+      const confirmed = peWallGap >= 30
       const d = pick('ce')
-      return { type: 'CE Buy', ...d, confirmed: true, logic: `TREND (${regime}): Bullish.${timeNote}` }
+      return { type: 'CE Buy', ...d, confirmed, logic: `TREND (${regime}): Bullish.${confirmed ? ` ✓ Confirmed — PE wall ${Math.round(peWallGap)} pts below.` : ` ⚠ Unconfirmed.`}${timeNote}` }
     }
-    // Generic TRENDING with neutral bias — use prior-day context to break the tie
     if (regime === 'TRENDING') {
       if (a.priorV <= -0.3) {
+        const confirmed = ceWallGap >= 30
         const d = pick('pe')
-        return { type: 'PE Buy', ...d, confirmed, logic: `TREND: Prior day bearish context — gap/close confirms downside.${timeNote}` }
+        return { type: 'PE Buy', ...d, confirmed, logic: `TREND: Prior day bearish.${confirmed ? ` ✓ Confirmed — CE wall ${Math.round(ceWallGap)} pts above.` : ' ⚠ Unconfirmed.'}${timeNote}` }
       }
       if (a.priorV >= 0.3) {
+        const confirmed = peWallGap >= 30
         const d = pick('ce')
-        return { type: 'CE Buy', ...d, confirmed: true, logic: `TREND: Prior day bullish context — gap/close confirms upside.${timeNote}` }
+        return { type: 'CE Buy', ...d, confirmed, logic: `TREND: Prior day bullish.${confirmed ? ` ✓ Confirmed — PE wall ${Math.round(peWallGap)} pts below.` : ' ⚠ Unconfirmed.'}${timeNote}` }
       }
     }
     return { type: 'No Trade', logic: `TREND MODE (${regime}): Direction unclear. Wait for confirmation.` }
@@ -374,6 +476,7 @@ function getRec(rows, spot, a, vix, candles, belowPDLStreak) {
 // ── CONSTANTS ─────────────────────────────────────────────────────────────────
 const BC = { BULLISH: '#22c55e', 'CAUTIOUSLY BULLISH': '#86efac', 'CAUTIOUSLY BEARISH': '#fb923c', BEARISH: '#ef4444', NEUTRAL: '#94a3b8' }
 const RC = { 'CE Buy': '#22c55e', 'PE Buy': '#ef4444', Straddle: '#fb923c', 'No Trade': '#64748b', Wait: '#f59e0b' }
+const REVERSAL_COL = { BOUNCE: '#22c55e', REJECTION: '#ef4444' }
 
 // ── APP ───────────────────────────────────────────────────────────────────────
 export default function App() {
@@ -416,7 +519,8 @@ export default function App() {
       api('historical', { to_date: to, from_date: from }),
       api('intraday'),
       api('vix-intraday'),
-    ]).then(([r1, r2, r3, r4, r5]) => {
+      api('intraday-5min'),
+    ]).then(([r1, r2, r3, r4, r5, r6]) => {
       if (r1.status === 'rejected') throw new Error('Chain failed')
       const chain = r1.value.data
       const spot = safe(() => chain[0].underlying_spot_price, 0)
@@ -430,6 +534,7 @@ export default function App() {
       const ic = r4.status === 'fulfilled' ? safe(() => r4.value.data?.candles || null) : null
       const vc = r5.status === 'fulfilled' ? safe(() => r5.value.data?.candles || [], []) : []
       const vix = vc.length ? safe(() => vc[vc.length - 1][4]) : null
+      const ic5 = r6.status === 'fulfilled' ? safe(() => r6.value.data?.candles || null) : null
 
       const rows = safe(() => chain.map(s => ({
         strike: s.strike_price,
@@ -460,8 +565,8 @@ export default function App() {
       if (pdl && spot < pdl) belowPDLRef.current = belowPDLRef.current + 1
       else belowPDLRef.current = 0
 
-      const a = safe(() => analyse(rows, spot, dte, oiData, vix, pdh, pdl, ic, prevClose, prev2Close))
-      const rec = safe(() => getRec(rows, spot, a, vix, ic, belowPDLRef.current), { type: 'No Trade', logic: 'Analysis error' })
+      const a = safe(() => analyse(rows, spot, dte, oiData, vix, pdh, pdl, ic, prevClose, prev2Close, ic5))
+      const rec = safe(() => getRec(rows, spot, a, vix, ic5, belowPDLRef.current), { type: 'No Trade', logic: 'Analysis error' })
       setData({ spot, rows, dte, ceW, peW, a, rec, vix, pdh, pdl, prevClose, prev2Close })
       setUpdated(new Date())
     }).catch(e => setErr(String(e?.message || e)))
@@ -658,6 +763,11 @@ export default function App() {
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <div>
                 <div style={{ fontFamily: "'Syne',sans-serif", fontWeight: 800, fontSize: 20, color: RC[data.rec.type] || '#64748b' }}>{data.rec.type}</div>
+                {data.rec.isReversal && (
+                  <div style={{ fontSize: 10, fontWeight: 700, marginTop: 3, color: REVERSAL_COL[data.rec.reversalType] || '#94a3b8' }}>
+                    ↩ {data.rec.reversalType} · 5-min confirmed
+                  </div>
+                )}
                 {data.rec.strike && <div style={{ fontSize: 22, fontWeight: 700, color: '#f8fafc', marginTop: 2 }}>{data.rec.strike}{data.rec.type === 'CE Buy' ? 'C' : data.rec.type === 'PE Buy' ? 'P' : ''}</div>}
               </div>
               {data.rec.cost && (
@@ -753,7 +863,10 @@ export default function App() {
                       <span style={{ fontSize: 10, color: '#334155', marginLeft: 8 }}>{t.regime}</span>
                       {t.confirmed === false && <span style={{ fontSize: 9, color: '#fb923c', marginLeft: 6 }}>UNCONFIRMED</span>}
                     </div>
-                    <div style={{ fontSize: 10, color: '#475569' }}>{t.time} {t.date}</div>
+                    <div style={{ textAlign: 'right' }}>
+                      <div style={{ fontSize: 10, color: '#475569' }}>{t.time} {t.date}</div>
+                      {t.spot && <div style={{ fontSize: 10, color: '#334155' }}>Nifty ₹{t.spot.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</div>}
+                    </div>
                   </div>
                   <div style={{ fontSize: 11, color: '#475569', marginTop: 4 }}>
                     Entry ₹{t.entryLTP} · SL ₹{t.sl} · TGT ₹{t.target} · R:R {t.rr}
