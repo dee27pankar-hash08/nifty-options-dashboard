@@ -343,10 +343,20 @@ function getRec(rows, spot, a, vix, candles, belowPDLStreak) {
   }
 
   if (bias === 'NEUTRAL' || conv < 25) {
+    // Don't suggest straddle if prior-day context is strongly directional
+    // — in a trending market a straddle always has one leg bleeding
+    if (a.priorV <= -0.3) {
+      const d = pick('pe')
+      return { type: 'PE Buy', ...d, logic: `Prior day strongly bearish — directional PE preferred over straddle.${timeNote}` }
+    }
+    if (a.priorV >= 0.3) {
+      const d = pick('ce')
+      return { type: 'CE Buy', ...d, logic: `Prior day strongly bullish — directional CE preferred over straddle.${timeNote}` }
+    }
     const sorted = [...rows].sort((x, y) => Math.abs(x.strike - spot) - Math.abs(y.strike - spot))
     for (const r of sorted.slice(0, 8)) {
       const c = (r.ce_ltp + r.pe_ltp) * LOT
-      if (c <= BUDGET) return { type: 'Straddle', strike: r.strike, ceLtp: r.ce_ltp, peLtp: r.pe_ltp, cost: c, lots: Math.floor(BUDGET / c), logic: 'No directional edge — straddle captures move either way' }
+      if (c <= BUDGET) return { type: 'Straddle', strike: r.strike, ceLtp: r.ce_ltp, peLtp: r.pe_ltp, cost: c, lots: Math.floor(BUDGET / c), logic: 'No directional edge, no prior day bias — straddle captures move either way' }
     }
     return { type: 'No Trade', logic: 'Low conviction — stay out' }
   }
