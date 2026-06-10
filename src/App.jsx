@@ -243,10 +243,12 @@ function calcLevels(side, ltp, delta, spot, a, candles, rows, isChannel) {
     } else {
       const cLow = safe(() => Math.min(...(candles || []).slice(-2).map(c => c[3])), spot - 50)
       niftySL = Math.round(Math.min(cLow - 20, spot - 30))
+      // Skip ATM noise — target must be at least 50pts away (or 30% of expected move)
+      const minTgt = Math.max(50, a.emRound * 0.3)
       niftyTGT = safe(() => {
-        const ab = rows.filter(r => r.strike > spot)
-        return ab.length ? ab.reduce((b, r) => r.ce_oi > b.ce_oi ? r : b, ab[0]).strike : spot + 300
-      }, spot + 300)
+        const ab = rows.filter(r => r.strike > spot + minTgt)
+        return ab.length ? ab.reduce((b, r) => r.ce_oi > b.ce_oi ? r : b, ab[0]).strike : spot + 200
+      }, spot + 200)
     }
   } else {
     if (isChannel) {
@@ -255,10 +257,12 @@ function calcLevels(side, ltp, delta, spot, a, candles, rows, isChannel) {
     } else {
       const cHigh = safe(() => Math.max(...(candles || []).slice(-2).map(c => c[2])), spot + 50)
       niftySL = Math.round(Math.max(cHigh + 20, spot + 30))
+      // Skip ATM noise — target must be at least 50pts away (or 30% of expected move)
+      const minTgt = Math.max(50, a.emRound * 0.3)
       niftyTGT = safe(() => {
-        const bl = rows.filter(r => r.strike < spot)
-        return bl.length ? bl.reduce((b, r) => r.pe_oi > b.pe_oi ? r : b, bl[0]).strike : spot - 300
-      }, spot - 300)
+        const bl = rows.filter(r => r.strike < spot - minTgt)
+        return bl.length ? bl.reduce((b, r) => r.pe_oi > b.pe_oi ? r : b, bl[0]).strike : spot - 200
+      }, spot - 200)
     }
   }
 
@@ -849,7 +853,22 @@ export default function App() {
           <div onClick={() => setShowLog(s => !s)}
             style={{ padding: '12px 16px', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <div style={{ fontSize: 11, fontWeight: 700, color: '#475569' }}>TRADE LOG ({tradeLog.length})</div>
-            <div style={{ fontSize: 11, color: '#334155' }}>{showLog ? '▲' : '▼'}</div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              {tradeLog.length > 0 && (
+                <div onClick={e => {
+                  e.stopPropagation()
+                  const blob = new Blob([JSON.stringify(tradeLog, null, 2)], { type: 'application/json' })
+                  const url = URL.createObjectURL(blob)
+                  const a = document.createElement('a')
+                  a.href = url; a.download = `nifty-log-${todayStr()}.json`
+                  a.click(); URL.revokeObjectURL(url)
+                }}
+                  style={{ fontSize: 10, color: '#475569', cursor: 'pointer', padding: '2px 6px', border: '1px solid #1e2a3a', borderRadius: 3 }}>
+                  ↓ export
+                </div>
+              )}
+              <div style={{ fontSize: 11, color: '#334155' }}>{showLog ? '▲' : '▼'}</div>
+            </div>
           </div>
           {showLog && (
             <div style={{ borderTop: '1px solid #1e2a3a', padding: '8px 12px' }}>
