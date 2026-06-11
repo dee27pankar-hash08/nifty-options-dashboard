@@ -87,7 +87,7 @@ function sigWalls(near, spot) {
 
   if (!ceM || !peM) return { vote: 0, R: spot + 300, S: spot - 300, zone: 'unknown', pos: 0.5, reason: 'Walls — insufficient data' }
   const R = ceM.strike, S = peM.strike
-  if (R - S < 150) return { vote: 0, R, S, zone: 'tight', pos: 0.5, reason: `Walls tight (${S}–${R})` }
+  if (R - S < 50) return { vote: 0, R, S, zone: 'tight', pos: 0.5, reason: `Walls too tight (${S}–${R})` }
   const pos = (spot - S) / (R - S)
   const str = (peM.pe_oi - ceM.ce_oi) / (peM.pe_oi + ceM.ce_oi)
   const v = clip(0.8 * (0.5 - pos) * 2 + 0.2 * str)
