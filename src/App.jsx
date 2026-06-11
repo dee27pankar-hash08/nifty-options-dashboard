@@ -63,8 +63,19 @@ function sigMaxPain(rows, spot, dte) {
 
 function sigWalls(near, spot) {
   if (!near.length) return { vote: 0, R: spot + 500, S: spot - 500, zone: 'unknown', pos: 0.5, reason: 'Walls — no data' }
-  const ceM = near.reduce((b, r) => r.ce_oi > b.ce_oi ? r : b, near[0])
-  const peM = near.reduce((b, r) => r.pe_oi > b.pe_oi ? r : b, near[0])
+
+  // CE wall (resistance) MUST be above spot — call writers protect strikes above current price
+  // PE wall (support) MUST be below spot — put writers protect strikes below current price
+  const aboveSpot = near.filter(r => r.strike > spot)
+  const belowSpot = near.filter(r => r.strike < spot)
+
+  // Fallback to nearest if no strikes on one side
+  const ceM = aboveSpot.length
+    ? aboveSpot.reduce((b, r) => r.ce_oi > b.ce_oi ? r : b, aboveSpot[0])
+    : near.reduce((b, r) => r.ce_oi > b.ce_oi ? r : b, near[0])
+  const peM = belowSpot.length
+    ? belowSpot.reduce((b, r) => r.pe_oi > b.pe_oi ? r : b, belowSpot[0])
+    : near.reduce((b, r) => r.pe_oi > b.pe_oi ? r : b, near[0])
   const R = ceM.strike, S = peM.strike
   if (R - S < 150) return { vote: 0, R, S, zone: 'tight', pos: 0.5, reason: `Walls tight (${S}–${R})` }
   const pos = (spot - S) / (R - S)
