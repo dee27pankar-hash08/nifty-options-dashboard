@@ -64,6 +64,10 @@ function sigMaxPain(rows, spot, dte) {
 function sigWalls(near, spot) {
   if (!near.length) return { vote: 0, R: spot + 500, S: spot - 500, zone: 'unknown', pos: 0.5, reason: 'Walls — no data' }
 
+  // Split into above/below spot first
+  const aboveSpot = near.filter(r => r.strike > spot)
+  const belowSpot = near.filter(r => r.strike < spot)
+
   // CE wall (resistance): nearest strike above spot with meaningful OI
   // Using nearest (not heaviest) because immediate resistance matters more for entries
   const ceAbove = aboveSpot.length ? [...aboveSpot].sort((a,b) => a.strike - b.strike) : []
