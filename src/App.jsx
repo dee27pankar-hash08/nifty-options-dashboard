@@ -259,6 +259,7 @@ function calcLevels(side, ltp, delta, spot, a, candles, rows, isChannel) {
 
   if (side === 'ce') {
     if (isChannel) {
+      // CE Buy near support: SL = below support wall, Target = resistance wall
       niftySL = Math.round(a.S - 30)
       niftyTGT = Math.round(a.R)
     } else {
@@ -274,8 +275,16 @@ function calcLevels(side, ltp, delta, spot, a, candles, rows, isChannel) {
     }
   } else {
     if (isChannel) {
+      // PE Buy near resistance: SL = above resistance wall, Target = support wall (full channel move)
       niftySL = Math.round(a.R + 30)
-      niftyTGT = Math.round(a.S)
+      // Target = PE wall below spot (full move to support) — use rows to find it
+      const peTarget = safe(() => {
+        const bl = rows.filter(r => r.strike < spot - 30)
+        if (!bl.length) return a.S
+        const top5 = [...bl].sort((a,b) => b.pe_oi - a.pe_oi).slice(0,5)
+        return top5.reduce((b,r) => r.strike > b.strike ? r : b, top5[0]).strike
+      }, a.S)
+      niftyTGT = Math.round(peTarget)
     } else {
       const cHigh = safe(() => Math.max(...(candles || []).slice(-2).map(c => c[2])), spot + 50)
       niftySL = Math.round(Math.max(cHigh + 20, spot + 30))
