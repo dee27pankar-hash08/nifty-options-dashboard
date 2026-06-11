@@ -414,9 +414,27 @@ function getRec(rows, spot, a, vix, candles5, belowPDLStreak) {
   if (isTrend) {
     if (timeScore === 0) return { type: 'No Trade', logic: 'TREND MODE: After 2 PM IST — no new trend entries. Theta risk too high.' }
 
-    // Price-based confirmation — instant, no waiting for refreshes
-    // Confirmed breakdown: nearest CE wall 30+ pts ABOVE spot (writers stepped back = breakdown is real)
-    // Confirmed breakout: nearest PE wall 30+ pts BELOW spot
+    // ── 5-min momentum alignment ─────────────────────────────────────────────
+    // Only enter when the last 5-min candle confirms direction
+    // PE Buy: last candle must be bearish (close < open OR close < prev close)
+    // CE Buy: last candle must be bullish (close > open OR close > prev close)
+    // If candle is retracing AGAINST trade → "Wait" — don't enter into retracement
+    let momentumBearish = null  // null = no candle data
+    let momentumBullish = null
+    let momentumNote = ''
+    if (candles5 && candles5.length >= 2) {
+      const lc5 = candles5[candles5.length - 1]  // last 5-min candle
+      const pc5 = candles5[candles5.length - 2]  // previous 5-min candle
+      const lOpen = lc5[1], lClose = lc5[4], pClose = pc5[4]
+      // Bearish: red candle (close < open) OR closed below prev candle's close
+      momentumBearish = lClose < lOpen || lClose < pClose
+      // Bullish: green candle (close > open) OR closed above prev candle's close
+      momentumBullish = lClose > lOpen || lClose > pClose
+      const candleDir = lClose < lOpen ? '🔴 bearish' : lClose > lOpen ? '🟢 bullish' : '⬜ flat'
+      momentumNote = ` 5-min candle ${candleDir} (${lClose.toFixed(0)} vs open ${lOpen.toFixed(0)}).`
+    }
+
+    // Price-based wall confirmation
     const nearestCeAbove = safe(() => {
       const ab = rows.filter(r => r.strike >= spot)
       return ab.length ? ab.reduce((b, r) => r.ce_oi > b.ce_oi ? r : b, ab[0]).strike : null
@@ -430,28 +448,50 @@ function getRec(rows, spot, a, vix, candles5, belowPDLStreak) {
     const timeNote = timeScore < 1.0 ? ' Post 11 AM — consider smaller size.' : ''
 
     if (regime === 'TRENDING DOWN' || (regime === 'TRENDING' && bias.includes('BEAR'))) {
-      const confirmed = ceWallGap >= 30
-      const bdNote = confirmed
-        ? ` ✓ Confirmed — CE wall ${Math.round(ceWallGap)} pts above spot.`
-        : ` ⚠ Unconfirmed — CE wall only ${Math.round(ceWallGap)} pts above, bounce risk.`
+      const wallOk = ceWallGap >= 30
+      const wallNote = wallOk
+        ? ` ✓ CE wall ${Math.round(ceWallGap)} pts above.`
+        : ` ⚠ CE wall only ${Math.round(ceWallGap)} pts above.`
+      // Block entry if 5-min candle is retracing UP — wait for it to resume down
+      if (momentumBearish === false) {
+        return { type: 'Wait', logic: `TREND (${regime}): Bearish but${momentumNote} Retracement in progress — wait for bearish candle before entering PE.` }
+      }
+      const confirmed = wallOk && momentumBearish !== false
       const d = pick('pe')
-      return { type: 'PE Buy', ...d, confirmed, logic: `TREND (${regime}): Bearish.${bdNote}${timeNote}` }
+      return { type: 'PE Buy', ...d, confirmed,
+        logic: `TREND (${regime}): Bearish.${wallNote}${momentumNote}${timeNote}` }
     }
+
     if (regime === 'TRENDING UP' || (regime === 'TRENDING' && bias.includes('BULL'))) {
-      const confirmed = peWallGap >= 30
+      const wallOk = peWallGap >= 30
+      // Block entry if 5-min candle is retracing DOWN
+      if (momentumBullish === false) {
+        return { type: 'Wait', logic: `TREND (${regime}): Bullish but${momentumNote} Retracement in progress — wait for bullish candle before entering CE.` }
+      }
+      const confirmed = wallOk && momentumBullish !== false
       const d = pick('ce')
-      return { type: 'CE Buy', ...d, confirmed, logic: `TREND (${regime}): Bullish.${confirmed ? ` ✓ Confirmed — PE wall ${Math.round(peWallGap)} pts below.` : ` ⚠ Unconfirmed.`}${timeNote}` }
+      return { type: 'CE Buy', ...d, confirmed,
+        logic: `TREND (${regime}): Bullish.${wallOk ? ` ✓ PE wall ${Math.round(peWallGap)} pts below.` : ` ⚠ PE wall only ${Math.round(peWallGap)} pts below.`}${momentumNote}${timeNote}` }
     }
+
     if (regime === 'TRENDING') {
       if (a.priorV <= -0.3) {
-        const confirmed = ceWallGap >= 30
+        if (momentumBearish === false) {
+          return { type: 'Wait', logic: `TREND: Prior day bearish but${momentumNote} Wait for bearish candle.` }
+        }
+        const confirmed = ceWallGap >= 30 && momentumBearish !== false
         const d = pick('pe')
-        return { type: 'PE Buy', ...d, confirmed, logic: `TREND: Prior day bearish.${confirmed ? ` ✓ Confirmed — CE wall ${Math.round(ceWallGap)} pts above.` : ' ⚠ Unconfirmed.'}${timeNote}` }
+        return { type: 'PE Buy', ...d, confirmed,
+          logic: `TREND: Prior day bearish.${confirmed ? ` ✓ Confirmed.` : ' ⚠ Unconfirmed.'}${momentumNote}${timeNote}` }
       }
       if (a.priorV >= 0.3) {
-        const confirmed = peWallGap >= 30
+        if (momentumBullish === false) {
+          return { type: 'Wait', logic: `TREND: Prior day bullish but${momentumNote} Wait for bullish candle.` }
+        }
+        const confirmed = peWallGap >= 30 && momentumBullish !== false
         const d = pick('ce')
-        return { type: 'CE Buy', ...d, confirmed, logic: `TREND: Prior day bullish.${confirmed ? ` ✓ Confirmed — PE wall ${Math.round(peWallGap)} pts below.` : ' ⚠ Unconfirmed.'}${timeNote}` }
+        return { type: 'CE Buy', ...d, confirmed,
+          logic: `TREND: Prior day bullish.${confirmed ? ` ✓ Confirmed.` : ' ⚠ Unconfirmed.'}${momentumNote}${timeNote}` }
       }
     }
     return { type: 'No Trade', logic: `TREND MODE (${regime}): Direction unclear. Wait for confirmation.` }
