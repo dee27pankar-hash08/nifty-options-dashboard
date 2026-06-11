@@ -243,12 +243,13 @@ function calcLevels(side, ltp, delta, spot, a, candles, rows, isChannel) {
     } else {
       const cLow = safe(() => Math.min(...(candles || []).slice(-2).map(c => c[3])), spot - 50)
       niftySL = Math.round(Math.min(cLow - 20, spot - 30))
-      // Skip ATM noise — target must be at least 50pts away (or 30% of expected move)
       const minTgt = Math.max(50, a.emRound * 0.3)
+      const maxTgt = a.emRound * 2  // cap at 2× expected move
       niftyTGT = safe(() => {
-        const ab = rows.filter(r => r.strike > spot + minTgt)
-        return ab.length ? ab.reduce((b, r) => r.ce_oi > b.ce_oi ? r : b, ab[0]).strike : spot + 200
-      }, spot + 200)
+        const ab = rows.filter(r => r.strike > spot + minTgt && r.strike <= spot + maxTgt)
+        if (ab.length) return ab.reduce((b, r) => r.ce_oi > b.ce_oi ? r : b, ab[0]).strike
+        return Math.round(spot + maxTgt)  // fallback: 2× EM above spot
+      }, Math.round(spot + maxTgt))
     }
   } else {
     if (isChannel) {
@@ -257,12 +258,13 @@ function calcLevels(side, ltp, delta, spot, a, candles, rows, isChannel) {
     } else {
       const cHigh = safe(() => Math.max(...(candles || []).slice(-2).map(c => c[2])), spot + 50)
       niftySL = Math.round(Math.max(cHigh + 20, spot + 30))
-      // Skip ATM noise — target must be at least 50pts away (or 30% of expected move)
       const minTgt = Math.max(50, a.emRound * 0.3)
+      const maxTgt = a.emRound * 2  // cap at 2× expected move
       niftyTGT = safe(() => {
-        const bl = rows.filter(r => r.strike < spot - minTgt)
-        return bl.length ? bl.reduce((b, r) => r.pe_oi > b.pe_oi ? r : b, bl[0]).strike : spot - 200
-      }, spot - 200)
+        const bl = rows.filter(r => r.strike < spot - minTgt && r.strike >= spot - maxTgt)
+        if (bl.length) return bl.reduce((b, r) => r.pe_oi > b.pe_oi ? r : b, bl[0]).strike
+        return Math.round(spot - maxTgt)  // fallback: 2× EM below spot
+      }, Math.round(spot - maxTgt))
     }
   }
 
