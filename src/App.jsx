@@ -25,6 +25,124 @@ const isOpen = () => {
   return d >= 1 && d <= 5 && m >= 9 * 60 + 15 && m <= 15 * 60 + 30
 }
 
+// ── OI STRUCTURE ANALYSIS ─────────────────────────────────────────────────────
+// Reads the full OI gradient instead of a single wall.
+// Market structure is layered: multiple CE/PE OI levels across strikes.
+// Price moves through these layers like a ball through sand.
+function analyzeOIStructure(rows, spot, oiData) {
+  // Build a clean per-strike OI map within ±400 pts (the actionable zone)
+  const ZONE = 400
+  const strikes = rows
+    .filter(r => Math.abs(r.strike - spot) <= ZONE && (r.ce_oi > 0 || r.pe_oi > 0))
+    .map(r => ({ strike: r.strike, ceOI: r.ce_oi, peOI: r.pe_oi }))
+    .sort((a, b) => a.strike - b.strike)
+
+  if (strikes.length < 3) {
+    return { ok: false, reason: 'Insufficient OI data' }
+  }
+
+  // OI change map (today's fresh positioning) — more predictive than total OI
+  const chgMap = {}
+  if (oiData?.call_put_oi_data_list) {
+    for (const s of oiData.call_put_oi_data_list) {
+      chgMap[s.strike_price] = { ceChg: s.call_change_oi || 0, peChg: s.put_change_oi || 0 }
+    }
+  }
+
+  const above = strikes.filter(s => s.strike > spot)
+  const below = strikes.filter(s => s.strike < spot)
+
+  // ── 1. DIRECTIONAL PRESSURE (the gradient, not a single wall) ──────────────
+  // Above spot: heavy CE OI = sellers capping upside (bearish)
+  // Below spot: heavy PE OI = buyers supporting (bullish)
+  // Weight each strike by proximity — closer strikes matter more
+  const proxWeight = (strike) => {
+    const dist = Math.abs(strike - spot)
+    return Math.max(0.2, 1 - dist / ZONE)  // 1.0 at spot → 0.2 at edge
+  }
+
+  let ceAboveWeighted = 0, peAboveWeighted = 0
+  let ceBelowWeighted = 0, peBelowWeighted = 0
+  for (const s of above) {
+    ceAboveWeighted += s.ceOI * proxWeight(s.strike)
+    peAboveWeighted += s.peOI * proxWeight(s.strike)
+  }
+  for (const s of below) {
+    ceBelowWeighted += s.ceOI * proxWeight(s.strike)
+    peBelowWeighted += s.peOI * proxWeight(s.strike)
+  }
+
+  // Resistance strength = CE OI stacked above (proximity-weighted)
+  // Support strength = PE OI stacked below (proximity-weighted)
+  const resistanceAbove = ceAboveWeighted
+  const supportBelow = peBelowWeighted
+
+  // Net directional pressure from structure:
+  // More support below than resistance above = bullish room, vice versa
+  const structVote = clip((supportBelow - resistanceAbove) / (supportBelow + resistanceAbove + 1))
+
+  // ── 2. OI CHANGE PRESSURE (fresh positioning today) ────────────────────────
+  // Fresh CE writing above = bearish; fresh PE writing below = bullish
+  let freshBull = 0, freshBear = 0
+  for (const s of strikes) {
+    const c = chgMap[s.strike]
+    if (!c) continue
+    const w = proxWeight(s.strike)
+    if (s.strike > spot) {
+      if (c.ceChg > 0) freshBear += c.ceChg * w       // writers selling calls above
+      if (c.peChg > 0) freshBull += c.peChg * w * 0.5 // some put writing above
+    } else {
+      if (c.peChg > 0) freshBull += c.peChg * w       // writers selling puts below
+      if (c.ceChg > 0) freshBear += c.ceChg * w * 0.5
+    }
+  }
+  const flowVote = (freshBull + freshBear) > 0 ? clip((freshBull - freshBear) / (freshBull + freshBear)) : 0
+
+  // ── 3. FIND OI CLUSTERS (layers, not single walls) ────────────────────────
+  // A cluster = strike with significant OI relative to the whole zone
+  // Use overall average across ALL strikes (both sides) so heavy walls on one
+  // side don't inflate that side's own threshold and disqualify themselves
+  const allCE = strikes.map(s => s.ceOI)
+  const allPE = strikes.map(s => s.peOI)
+  const avgCEall = allCE.reduce((s, v) => s + v, 0) / (allCE.length || 1)
+  const avgPEall = allPE.reduce((s, v) => s + v, 0) / (allPE.length || 1)
+
+  // Resistance zones: strikes above with CE OI above overall CE average
+  const resistanceZones = above
+    .filter(s => s.ceOI > avgCEall)
+    .map(s => ({ strike: s.strike, oi: s.ceOI, dist: s.strike - spot }))
+    .sort((a, b) => a.dist - b.dist)
+
+  // Support zones: strikes below with PE OI above overall PE average
+  const supportZones = below
+    .filter(s => s.peOI > avgPEall)
+    .map(s => ({ strike: s.strike, oi: s.peOI, dist: spot - s.strike }))
+    .sort((a, b) => a.dist - b.dist)
+
+  // ── 4. POSITION IN LANDSCAPE ───────────────────────────────────────────────
+  // Where is spot relative to the nearest significant barriers on each side?
+  const nearestRes = resistanceZones[0] || null
+  const nearestSup = supportZones[0] || null
+
+  // How much "headroom" before hitting next resistance/support cluster
+  const headroomUp = nearestRes ? nearestRes.dist : ZONE
+  const headroomDown = nearestSup ? nearestSup.dist : ZONE
+
+  return {
+    ok: true,
+    structVote,       // directional pressure from OI gradient
+    flowVote,         // directional pressure from today's OI change
+    resistanceAbove,  // total weighted CE OI above
+    supportBelow,     // total weighted PE OI below
+    resistanceZones,  // array of resistance clusters above
+    supportZones,     // array of support clusters below
+    nearestRes,       // nearest resistance cluster {strike, oi, dist}
+    nearestSup,       // nearest support cluster {strike, oi, dist}
+    headroomUp,       // pts to nearest resistance
+    headroomDown,     // pts to nearest support
+  }
+}
+
 // ── SIGNALS ───────────────────────────────────────────────────────────────────
 function sigPCR(near) {
   const ce = near.reduce((s, r) => s + r.ce_oi, 0) || 1
@@ -257,27 +375,29 @@ function calcLevels(side, ltp, delta, spot, a, candles, rows, isChannel) {
 
   let niftySL, niftyTGT
 
+  // Get OI structure for cluster-based targets in trend mode
+  const oi = !isChannel ? safe(() => analyzeOIStructure(rows, spot, a.oiData), { ok: false }) : { ok: false }
+
   if (side === 'ce') {
     if (isChannel) {
-      // CE Buy near support: SL = below support wall, Target = resistance wall
       niftySL = Math.round(a.S - 30)
       niftyTGT = Math.round(a.R)
     } else {
       const cLow = safe(() => Math.min(...(candles || []).slice(-2).map(c => c[3])), spot - 50)
       niftySL = Math.round(Math.min(cLow - 20, spot - 30))
-      const minTgt = Math.max(50, a.emRound * 0.3)
-      const maxTgt = a.emRound * 2  // cap at 2× expected move
-      niftyTGT = safe(() => {
-        const ab = rows.filter(r => r.strike > spot + minTgt && r.strike <= spot + maxTgt)
-        if (ab.length) return ab.reduce((b, r) => r.ce_oi > b.ce_oi ? r : b, ab[0]).strike
-        return Math.round(spot + maxTgt)  // fallback: 2× EM above spot
-      }, Math.round(spot + maxTgt))
+      // Target = next resistance CLUSTER above (from OI gradient), capped at 2× EM
+      const maxTgt = a.emRound * 2
+      if (oi.ok && oi.resistanceZones.length) {
+        // First meaningful cluster at least 40pts away; if spot is between clusters, aim for next one up
+        const tgt = oi.resistanceZones.find(z => z.dist >= 40 && z.dist <= maxTgt)
+        niftyTGT = tgt ? tgt.strike : Math.round(Math.min(spot + a.emRound, spot + maxTgt))
+      } else {
+        niftyTGT = Math.round(spot + Math.max(50, a.emRound))
+      }
     }
   } else {
     if (isChannel) {
-      // PE Buy near resistance: SL = above resistance wall, Target = support wall (full channel move)
       niftySL = Math.round(a.R + 30)
-      // Target = PE wall below spot (full move to support) — use rows to find it
       const peTarget = safe(() => {
         const bl = rows.filter(r => r.strike < spot - 30)
         if (!bl.length) return a.S
@@ -288,13 +408,14 @@ function calcLevels(side, ltp, delta, spot, a, candles, rows, isChannel) {
     } else {
       const cHigh = safe(() => Math.max(...(candles || []).slice(-2).map(c => c[2])), spot + 50)
       niftySL = Math.round(Math.max(cHigh + 20, spot + 30))
-      const minTgt = Math.max(50, a.emRound * 0.3)
-      const maxTgt = a.emRound * 2  // cap at 2× expected move
-      niftyTGT = safe(() => {
-        const bl = rows.filter(r => r.strike < spot - minTgt && r.strike >= spot - maxTgt)
-        if (bl.length) return bl.reduce((b, r) => r.pe_oi > b.pe_oi ? r : b, bl[0]).strike
-        return Math.round(spot - maxTgt)  // fallback: 2× EM below spot
-      }, Math.round(spot - maxTgt))
+      // Target = next support CLUSTER below (from OI gradient), capped at 2× EM
+      const maxTgt = a.emRound * 2
+      if (oi.ok && oi.supportZones.length) {
+        const tgt = oi.supportZones.find(z => z.dist >= 40 && z.dist <= maxTgt)
+        niftyTGT = tgt ? tgt.strike : Math.round(Math.max(spot - a.emRound, spot - maxTgt))
+      } else {
+        niftyTGT = Math.round(spot - Math.max(50, a.emRound))
+      }
     }
   }
 
@@ -445,85 +566,82 @@ function getRec(rows, spot, a, vix, candles5, belowPDLStreak) {
     if (timeScore === 0) return { type: 'No Trade', logic: 'TREND MODE: After 2 PM IST — no new trend entries. Theta risk too high.' }
 
     // ── 5-min momentum alignment ─────────────────────────────────────────────
-    // Only enter when the last 5-min candle confirms direction
-    // PE Buy: last candle must be bearish (close < open OR close < prev close)
-    // CE Buy: last candle must be bullish (close > open OR close > prev close)
-    // If candle is retracing AGAINST trade → "Wait" — don't enter into retracement
-    let momentumBearish = null  // null = no candle data
-    let momentumBullish = null
-    let momentumNote = ''
+    let momentumBearish = null, momentumBullish = null, momentumNote = ''
     if (candles5 && candles5.length >= 2) {
-      const lc5 = candles5[candles5.length - 1]  // last 5-min candle
-      const pc5 = candles5[candles5.length - 2]  // previous 5-min candle
+      const lc5 = candles5[candles5.length - 1]
+      const pc5 = candles5[candles5.length - 2]
       const lOpen = lc5[1], lClose = lc5[4], pClose = pc5[4]
-      // Bearish: red candle (close < open) OR closed below prev candle's close
       momentumBearish = lClose < lOpen || lClose < pClose
-      // Bullish: green candle (close > open) OR closed above prev candle's close
       momentumBullish = lClose > lOpen || lClose > pClose
       const candleDir = lClose < lOpen ? '🔴 bearish' : lClose > lOpen ? '🟢 bullish' : '⬜ flat'
       momentumNote = ` 5-min candle ${candleDir} (${lClose.toFixed(0)} vs open ${lOpen.toFixed(0)}).`
     }
 
-    // Price-based wall confirmation
-    const nearestCeAbove = safe(() => {
-      const ab = rows.filter(r => r.strike >= spot)
-      return ab.length ? ab.reduce((b, r) => r.ce_oi > b.ce_oi ? r : b, ab[0]).strike : null
-    }, null)
-    const nearestPeBelow = safe(() => {
-      const bl = rows.filter(r => r.strike <= spot)
-      return bl.length ? bl.reduce((b, r) => r.pe_oi > b.pe_oi ? r : b, bl[0]).strike : null
-    }, null)
-    const ceWallGap = nearestCeAbove != null ? nearestCeAbove - spot : 0
-    const peWallGap = nearestPeBelow != null ? spot - nearestPeBelow : 0
+    // ── OI STRUCTURE (the gradient) ──────────────────────────────────────────
+    const oi = safe(() => analyzeOIStructure(rows, spot, a.oiData), { ok: false })
     const timeNote = timeScore < 1.0 ? ' Post 11 AM — consider smaller size.' : ''
 
-    if (regime === 'TRENDING DOWN' || (regime === 'TRENDING' && bias.includes('BEAR'))) {
-      const wallOk = ceWallGap >= 30
-      const wallNote = wallOk
-        ? ` ✓ CE wall ${Math.round(ceWallGap)} pts above.`
-        : ` ⚠ CE wall only ${Math.round(ceWallGap)} pts above.`
-      // Block entry if 5-min candle is retracing UP — wait for it to resume down
+    // Move exhaustion check applies to all trend trades
+    const moveExhausted = a.dayRange > a.emRound * 0.85
+    if (moveExhausted) {
+      return { type: 'No Trade', logic: `TREND (${regime}): Day range ${a.dayRange}pts is ${Math.round(a.dayRange/a.emRound*100)}% of expected move (±${a.emRound}pts) — move likely exhausted, don't chase.` }
+    }
+
+    // Determine intended direction from regime + prior-day context
+    let dir = null  // 'bear' or 'bull'
+    if (regime === 'TRENDING DOWN' || (regime === 'TRENDING' && bias.includes('BEAR'))) dir = 'bear'
+    else if (regime === 'TRENDING UP' || (regime === 'TRENDING' && bias.includes('BULL'))) dir = 'bull'
+    else if (regime === 'TRENDING' && a.priorV <= -0.3) dir = 'bear'
+    else if (regime === 'TRENDING' && a.priorV >= 0.3) dir = 'bull'
+
+    if (!dir) return { type: 'No Trade', logic: `TREND MODE (${regime}): Direction unclear. Wait for confirmation.` }
+
+    // ── BEARISH TREND → PE Buy ───────────────────────────────────────────────
+    if (dir === 'bear') {
+      // Momentum gate: don't enter into an upward retracement
       if (momentumBearish === false) {
-        return { type: 'Wait', logic: `TREND (${regime}): Bearish but${momentumNote} Retracement in progress — wait for bearish candle before entering PE.` }
+        return { type: 'Wait', logic: `TREND (${regime}): Bearish but${momentumNote} Retracement up — wait for bearish 5-min candle before PE entry.` }
       }
-      const confirmed = wallOk && momentumBearish !== false
+      // OI structure gate: is there room to fall? (headroom down to next support cluster)
+      let structNote = '', confirmed = false
+      if (oi.ok) {
+        // Confirmation: OI gradient agrees (structVote bearish) OR fresh CE writing above (flowVote bearish)
+        const structAgrees = oi.structVote < -0.1 || oi.flowVote < -0.15
+        // Headroom: at least 40pts to next support cluster (room for the move)
+        const hasRoom = oi.headroomDown >= 40
+        confirmed = structAgrees && hasRoom && momentumBearish !== false
+        const supTxt = oi.nearestSup ? `support cluster ${oi.nearestSup.strike} (${Math.round(oi.headroomDown)}pts away, ${fmtOI(oi.nearestSup.oi)})` : 'no nearby support'
+        structNote = ` ${structAgrees ? '✓' : '⚠'} OI ${oi.structVote < -0.1 ? 'gradient bearish' : oi.flowVote < -0.15 ? 'fresh CE writing above' : 'gradient neutral'}, next ${supTxt}.`
+        if (!hasRoom) {
+          return { type: 'No Trade', logic: `TREND (${regime}): Bearish but spot sitting on support cluster ${oi.nearestSup?.strike} (${Math.round(oi.headroomDown)}pts) — no room to fall, wait for breakdown.` }
+        }
+      }
       const d = pick('pe')
       return { type: 'PE Buy', ...d, confirmed,
-        logic: `TREND (${regime}): Bearish.${wallNote}${momentumNote}${timeNote}` }
+        logic: `TREND (${regime}): Bearish.${structNote}${momentumNote}${timeNote}` }
     }
 
-    if (regime === 'TRENDING UP' || (regime === 'TRENDING' && bias.includes('BULL'))) {
-      const wallOk = peWallGap >= 30
-      // Block entry if 5-min candle is retracing DOWN
+    // ── BULLISH TREND → CE Buy ───────────────────────────────────────────────
+    if (dir === 'bull') {
       if (momentumBullish === false) {
-        return { type: 'Wait', logic: `TREND (${regime}): Bullish but${momentumNote} Retracement in progress — wait for bullish candle before entering CE.` }
+        return { type: 'Wait', logic: `TREND (${regime}): Bullish but${momentumNote} Retracement down — wait for bullish 5-min candle before CE entry.` }
       }
-      const confirmed = wallOk && momentumBullish !== false
+      let structNote = '', confirmed = false
+      if (oi.ok) {
+        const structAgrees = oi.structVote > 0.1 || oi.flowVote > 0.15
+        const hasRoom = oi.headroomUp >= 40
+        confirmed = structAgrees && hasRoom && momentumBullish !== false
+        const resTxt = oi.nearestRes ? `resistance cluster ${oi.nearestRes.strike} (${Math.round(oi.headroomUp)}pts away, ${fmtOI(oi.nearestRes.oi)})` : 'no nearby resistance'
+        structNote = ` ${structAgrees ? '✓' : '⚠'} OI ${oi.structVote > 0.1 ? 'gradient bullish' : oi.flowVote > 0.15 ? 'fresh PE writing below' : 'gradient neutral'}, next ${resTxt}.`
+        if (!hasRoom) {
+          return { type: 'No Trade', logic: `TREND (${regime}): Bullish but spot sitting under resistance cluster ${oi.nearestRes?.strike} (${Math.round(oi.headroomUp)}pts) — no room to rise, wait for breakout.` }
+        }
+      }
       const d = pick('ce')
       return { type: 'CE Buy', ...d, confirmed,
-        logic: `TREND (${regime}): Bullish.${wallOk ? ` ✓ PE wall ${Math.round(peWallGap)} pts below.` : ` ⚠ PE wall only ${Math.round(peWallGap)} pts below.`}${momentumNote}${timeNote}` }
+        logic: `TREND (${regime}): Bullish.${structNote}${momentumNote}${timeNote}` }
     }
 
-    if (regime === 'TRENDING') {
-      if (a.priorV <= -0.3) {
-        if (momentumBearish === false) {
-          return { type: 'Wait', logic: `TREND: Prior day bearish but${momentumNote} Wait for bearish candle.` }
-        }
-        const confirmed = ceWallGap >= 30 && momentumBearish !== false
-        const d = pick('pe')
-        return { type: 'PE Buy', ...d, confirmed,
-          logic: `TREND: Prior day bearish.${confirmed ? ` ✓ Confirmed.` : ' ⚠ Unconfirmed.'}${momentumNote}${timeNote}` }
-      }
-      if (a.priorV >= 0.3) {
-        if (momentumBullish === false) {
-          return { type: 'Wait', logic: `TREND: Prior day bullish but${momentumNote} Wait for bullish candle.` }
-        }
-        const confirmed = peWallGap >= 30 && momentumBullish !== false
-        const d = pick('ce')
-        return { type: 'CE Buy', ...d, confirmed,
-          logic: `TREND: Prior day bullish.${confirmed ? ` ✓ Confirmed.` : ' ⚠ Unconfirmed.'}${momentumNote}${timeNote}` }
-      }
-    }
     return { type: 'No Trade', logic: `TREND MODE (${regime}): Direction unclear. Wait for confirmation.` }
   }
 
