@@ -257,7 +257,7 @@ function getTrend(candles, spot) {
 }
 
 // ── ANALYSIS ──────────────────────────────────────────────────────────────────
-function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles, prevClose, prev2Close) {
+function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles, prevClose, prev2Close, candles5) {
   const near = rows.filter(r => Math.abs(r.strike - spot) <= NTM)
   if (!near.length) return null
 
@@ -323,28 +323,53 @@ function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles, prevClose, pre
   const atm = rows.reduce((b, r) => Math.abs(r.strike - spot) < Math.abs(b.strike - spot) ? r : b, rows[0])
   const em = atm.ce_ltp + atm.pe_ltp
 
-  // Channel detection — all 3 must pass
+  // ── REGIME DETECTION ──────────────────────────────────────────────────────
+  // Core fix: spot crossing PDH/PDL is NOT enough for TRENDING UP/DOWN
+  // A single spike above PDH that immediately reverses = false breakout (channel)
+  // Requires: 2+ consecutive 5-min candles closing above PDH (or below PDL)
+  // This prevents a post-crash bounce from being misread as TRENDING UP
+
   const insidePDHL = pdh && pdl ? (spot < pdh && spot > pdl) : true
   let todayHigh = spot, todayLow = spot
-  if (candles && candles.length) { todayHigh = Math.max(...candles.map(c => c[2] || spot)); todayLow = Math.min(...candles.map(c => c[3] || spot)) }
+  if (candles && candles.length) {
+    todayHigh = Math.max(...candles.map(c => c[2] || spot))
+    todayLow = Math.min(...candles.map(c => c[3] || spot))
+  }
   const dayRange = todayHigh - todayLow
+
+  // Sustained trend: 3 consecutive 30-min candles each moving >0.1% in same direction
   let sustained = false
   if (candles && candles.length >= 3) {
     const c3 = candles.slice(-3).map(c => safe(() => c[4], spot))
     const minMove = spot * 0.001
-    const allUp = c3[0] < c3[1] && c3[1] < c3[2] && (c3[1] - c3[0]) > minMove && (c3[2] - c3[1]) > minMove
-    const allDown = c3[0] > c3[1] && c3[1] > c3[2] && (c3[0] - c3[1]) > minMove && (c3[1] - c3[2]) > minMove
+    const allUp = c3[0] < c3[1] && c3[1] < c3[2] && (c3[1]-c3[0]) > minMove && (c3[2]-c3[1]) > minMove
+    const allDown = c3[0] > c3[1] && c3[1] > c3[2] && (c3[0]-c3[1]) > minMove && (c3[1]-c3[2]) > minMove
     sustained = allUp || allDown
   }
+
+  // Breakout confirmation via 5-min candles
+  // TRENDING UP only if last 2 consecutive 5-min candles BOTH closed above PDH
+  // TRENDING DOWN only if last 2 consecutive 5-min candles BOTH closed below PDL
+  let confirmedBreakoutUp = false, confirmedBreakoutDown = false
+  if (candles5 && candles5.length >= 2 && pdh && pdl) {
+    const last2 = candles5.slice(-2)
+    confirmedBreakoutUp = last2.every(c => c[4] > pdh)    // both close above PDH
+    confirmedBreakoutDown = last2.every(c => c[4] < pdl)  // both close below PDL
+  } else if (!candles5 && !insidePDHL) {
+    // No 5-min data available — fall back to single-bar PDH/PDL check
+    confirmedBreakoutUp = spot > pdh
+    confirmedBreakoutDown = spot < pdl
+  }
+
   const tightRange = dayRange < em * 0.65
-  const isChannel = insidePDHL && tightRange && !sustained
-  const isTrend = !insidePDHL || sustained || dayRange > em * 0.9
+  const isChannel = !confirmedBreakoutUp && !confirmedBreakoutDown && tightRange && !sustained
+  const isTrend = confirmedBreakoutUp || confirmedBreakoutDown || sustained || dayRange > em * 0.9
   const nearSup = isChannel && wall.pos < 0.25
   const nearRes = isChannel && wall.pos > 0.75
 
   let regime = 'RANGING'
-  if (isTrend && pdh && spot > pdh) regime = 'TRENDING UP'
-  else if (isTrend && pdl && spot < pdl) regime = 'TRENDING DOWN'
+  if (confirmedBreakoutUp) regime = 'TRENDING UP'
+  else if (confirmedBreakoutDown) regime = 'TRENDING DOWN'
   else if (isTrend) regime = 'TRENDING'
   else if (isChannel) regime = 'CHANNELING'
 
