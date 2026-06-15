@@ -253,13 +253,30 @@ function getTrend(candles, spot) {
   if (!candles || candles.length < 2) return { trend: 'unknown', trendVote: 0, timeWarning: null }
   const lc = safe(() => candles[candles.length - 1][4], spot)
   const pc = safe(() => candles[candles.length - 2][4], spot)
-  const trendVote = lc > pc ? 0.3 : lc < pc ? -0.3 : 0
-  const trend = lc > pc ? 'up' : lc < pc ? 'down' : 'flat'
+
+  // Net move over the last 3 candles — captures the dominant recent direction
+  // rather than just the last pair. A big drop followed by a tiny uptick
+  // (lc > pc) should still register as "down" if the net 3-candle move is down.
+  const idx3 = candles.length - 4
+  const c3 = idx3 >= 0 ? safe(() => candles[idx3][4], lc) : pc
+  const net3 = lc - c3
+  const minMove = spot * 0.001  // ~0.1% — meaningful net move threshold
+
+  let trend, trendVote
+  if (Math.abs(net3) > minMove) {
+    trend = net3 > 0 ? 'up' : 'down'
+    trendVote = net3 > 0 ? 0.3 : -0.3
+  } else {
+    // Net-3 is flat — fall back to last-pair, but weaker conviction
+    trend = lc > pc ? 'up' : lc < pc ? 'down' : 'flat'
+    trendVote = lc > pc ? 0.15 : lc < pc ? -0.15 : 0
+  }
+
   const mins = getISTMins()
   let timeWarning = null
   if (mins < 9 * 60 + 45) timeWarning = 'Opening volatility (9:15–9:45 IST) — wait for settlement'
   else if (mins > 14 * 60 + 45) timeWarning = 'Last 45 mins — theta collapse, avoid buying options'
-  return { trend, trendVote, timeWarning, lc, pc }
+  return { trend, trendVote, timeWarning, lc, pc, c3, net3 }
 }
 
 // ── ANALYSIS ──────────────────────────────────────────────────────────────────
@@ -304,7 +321,7 @@ function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles, prevClose, pre
     { v: skew.vote, w: 1.5, r: skew.reason },
     { v: vixS.vote, w: 1.0, r: vixS.reason },
     { v: pdhl.vote, w: 1.5, r: pdhl.reason },
-    { v: tctx.trendVote, w: 0.8, r: `30min trend ${tctx.trend} (${tctx.lc ? tctx.lc.toFixed(0) : '—'} vs ${tctx.pc ? tctx.pc.toFixed(0) : '—'})` },
+    { v: tctx.trendVote, w: 0.8, r: `30min trend ${tctx.trend} (net 3-candle ${tctx.net3 != null ? (tctx.net3 >= 0 ? '+' : '') + tctx.net3.toFixed(0) : '—'}pts, last ${tctx.lc ? tctx.lc.toFixed(0) : '—'})` },
     { v: priorV, w: 2.0, r: priorReason },   // prior-day context — high weight, captures what intraday misses
   ]
 
