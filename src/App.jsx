@@ -107,15 +107,21 @@ function analyzeOIStructure(rows, spot, oiData) {
   const avgCEall = allCE.reduce((s, v) => s + v, 0) / (allCE.length || 1)
   const avgPEall = allPE.reduce((s, v) => s + v, 0) / (allPE.length || 1)
 
-  // Resistance zones: strikes above with CE OI above overall CE average
+  // Exclude strikes within NOISE_ZONE of spot — the nearest strike to spot is
+  // always the most-traded (ATM/NTM) and naturally has elevated OI regardless
+  // of whether it represents a real barrier. Without this, "resistance 29pts
+  // away" on a breakout day is just ATM noise, not a meaningful wall.
+  const NOISE_ZONE = 40
+
+  // Resistance zones: strikes above with CE OI above overall CE average, beyond noise zone
   const resistanceZones = above
-    .filter(s => s.ceOI > avgCEall)
+    .filter(s => s.ceOI > avgCEall && (s.strike - spot) > NOISE_ZONE)
     .map(s => ({ strike: s.strike, oi: s.ceOI, dist: s.strike - spot }))
     .sort((a, b) => a.dist - b.dist)
 
-  // Support zones: strikes below with PE OI above overall PE average
+  // Support zones: strikes below with PE OI above overall PE average, beyond noise zone
   const supportZones = below
-    .filter(s => s.peOI > avgPEall)
+    .filter(s => s.peOI > avgPEall && (spot - s.strike) > NOISE_ZONE)
     .map(s => ({ strike: s.strike, oi: s.peOI, dist: spot - s.strike }))
     .sort((a, b) => a.dist - b.dist)
 
