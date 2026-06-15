@@ -373,8 +373,26 @@ function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles, prevClose, pre
   const nearSup = isChannel && wall.pos < 0.25
   const nearRes = isChannel && wall.pos > 0.75
 
+  // ── CONSOLIDATION CHECK (within an established trend) ──────────────────────
+  // After a confirmed breakout, price can settle into its OWN tight range —
+  // regime stays "TRENDING UP" forever (still above yesterday's PDH), but for
+  // trading purposes it's now range-bound. Detect this from the last ~30min
+  // (6 x 5-min candles) of TODAY's own price action, independent of PDH/PDL.
+  let recentHigh = null, recentLow = null, isConsolidating = false
+  if (candles5 && candles5.length >= 6) {
+    const recent = candles5.slice(-6)
+    recentHigh = Math.max(...recent.map(c => c[2]))
+    recentLow = Math.min(...recent.map(c => c[3]))
+    const recentRange = recentHigh - recentLow
+    // Tight relative to EM, and not currently making a fresh extreme
+    const atFreshHigh = spot >= todayHigh - 5
+    const atFreshLow = spot <= todayLow + 5
+    isConsolidating = (isTrend && !sustained) && recentRange < em * 0.35 && !atFreshHigh && !atFreshLow
+  }
+
   let regime = 'RANGING'
-  if (confirmedBreakoutUp) regime = 'TRENDING UP'
+  if (isConsolidating) regime = confirmedBreakoutUp ? 'CONSOLIDATING (UP)' : confirmedBreakoutDown ? 'CONSOLIDATING (DOWN)' : 'CONSOLIDATING'
+  else if (confirmedBreakoutUp) regime = 'TRENDING UP'
   else if (confirmedBreakoutDown) regime = 'TRENDING DOWN'
   else if (isTrend) regime = 'TRENDING'
   else if (isChannel) regime = 'CHANNELING'
@@ -389,7 +407,7 @@ function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles, prevClose, pre
     bias, conv, score, reasons: ranked.map(x => x.r),
     pcr: pcr.pcr, maxPain: mp.maxPain,
     R: wall.R, S: wall.S, wallPos: wall.pos, wallZone: wall.zone,
-    nearSup, nearRes, isChannel, isTrend, regime,
+    nearSup, nearRes, isChannel, isTrend, regime, isConsolidating, recentHigh, recentLow,
     bld, vixZone: vixS.zone,
     timeWarning: tctx.timeWarning, trend: tctx.trend, tLc: tctx.lc, tPc: tctx.pc,
     em, emRound: Math.round(em),
@@ -542,7 +560,7 @@ function getRec(rows, spot, a, vix, candles5, belowPDLStreak) {
 
   const streak = belowPDLStreak || 0
 
-  const pick = (side) => safe(() => {
+  const pick = (side, overrides = {}) => safe(() => {
     const lt = `${side}_ltp`, dl = `${side}_delta`
     const bk = `${side}_bid`, ak = `${side}_ask`
     const aff = rows
@@ -558,7 +576,9 @@ function getRec(rows, spot, a, vix, candles5, belowPDLStreak) {
     })
     const row = cand[0], cost = row[lt] * LOT
     const spread = +row._sp.toFixed(1)
-    const levels = calcLevels(side, row[lt], row[dl], spot, a, candles5 || [], rows, isChannel)
+    const useChannel = overrides.isChannel ?? isChannel
+    const aForLevels = overrides.a || a
+    const levels = calcLevels(side, row[lt], row[dl], spot, aForLevels, candles5 || [], rows, useChannel)
     return {
       strike: row.strike, ltp: row[lt], delta: row[dl],
       theta: row[`${side}_theta`], iv: row[`${side}_iv`],
@@ -585,6 +605,28 @@ function getRec(rows, spot, a, vix, candles5, belowPDLStreak) {
         logic: `REVERSAL (${reversal.strength.toUpperCase()}): ${reversal.reason}`,
       }
     }
+  }
+
+  // ── CONSOLIDATING (within a trend) ────────────────────────────────────────
+  // Price established a trend (still above/below yesterday's PDH/PDL) but has
+  // settled into its OWN tight range over the last ~30min. Trade this range
+  // using TODAY's recent high/low as support/resistance — same bounce/rejection
+  // logic as CHANNELING, just with different boundaries.
+  if (a.isConsolidating && a.recentHigh && a.recentLow) {
+    const rH = a.recentHigh, rL = a.recentLow
+    const rangeSize = rH - rL
+    const buffer = Math.max(10, rangeSize * 0.2)
+    const aMod = { ...a, S: Math.round(rL), R: Math.round(rH) }
+
+    if (spot <= rL + buffer) {
+      const d = pick('ce', { isChannel: true, a: aMod })
+      return { type: 'CE Buy', ...d, logic: `${regime}: Price consolidating ${Math.round(rL)}–${Math.round(rH)} (last 30min). Near range low (${Math.round(rL)}) — bounce setup.${vix > 16 ? ' VIX elevated, size small.' : ''}` }
+    }
+    if (spot >= rH - buffer) {
+      const d = pick('pe', { isChannel: true, a: aMod })
+      return { type: 'PE Buy', ...d, logic: `${regime}: Price consolidating ${Math.round(rL)}–${Math.round(rH)} (last 30min). Near range high (${Math.round(rH)}) — rejection setup.${vix > 16 ? ' VIX elevated, size small.' : ''}` }
+    }
+    return { type: 'No Trade', logic: `${regime}: Price consolidating ${Math.round(rL)}–${Math.round(rH)} (last 30min). Spot mid-range — wait for edge.` }
   }
 
   if (isChannel) {
@@ -1041,7 +1083,7 @@ export default function App() {
               </div>
             )}
             {data.rec.lowQ && <div style={{ marginTop: 4, fontSize: 11, color: '#fb923c' }}>⚠ Far-OTM only within budget</div>}
-            {data.dte <= 2 && !['No Trade', 'Wait'].includes(data.rec.type) && <div style={{ marginTop: 4, fontSize: 11, color: '#fb923c' }}>⚠ {data.dte}d to expiry — steep theta</div>}
+
 
             {/* Levels */}
             {data.rec.levels && (() => {
