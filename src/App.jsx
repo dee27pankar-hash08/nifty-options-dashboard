@@ -426,7 +426,7 @@ function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles, prevClose, pre
     R: wall.R, S: wall.S, wallPos: wall.pos, wallZone: wall.zone,
     nearSup, nearRes, isChannel, isTrend, regime, isConsolidating, recentHigh, recentLow,
     bld, vixZone: vixS.zone,
-    timeWarning: tctx.timeWarning, trend: tctx.trend, tLc: tctx.lc, tPc: tctx.pc,
+    timeWarning: tctx.timeWarning, trend: tctx.trend, tLc: tctx.lc, tPc: tctx.pc, tNet3: tctx.net3,
     em, emRound: Math.round(em),
     insidePDHL, tightRange, sustained,
     dayRange: Math.round(dayRange), timeScore, priorV, oiData
@@ -1002,7 +1002,7 @@ export default function App() {
           {[
             { label: 'INDIA VIX', val: data.vix != null ? data.vix.toFixed(1) : '—', sub: a.vixZone, color: data.vix > 16 ? '#fb923c' : data.vix < 13 ? '#22c55e' : '#94a3b8' },
             { label: 'PDH / PDL', val: data.pdh ? data.pdh.toFixed(0) : '—', val2: data.pdl ? data.pdl.toFixed(0) : '—', sub: 'high / low' },
-            { label: '30M TREND', val: a.trend === 'up' ? '↑' : a.trend === 'down' ? '↓' : '→', sub: a.trend, color: a.trend === 'up' ? '#22c55e' : a.trend === 'down' ? '#ef4444' : '#94a3b8' },
+            { label: '30M TREND', val: a.trend === 'up' ? '↑' : a.trend === 'down' ? '↓' : '→', sub: a.tNet3 != null ? `${a.trend} (net3 ${a.tNet3 >= 0 ? '+' : ''}${a.tNet3.toFixed(0)}pts)` : a.trend, color: a.trend === 'up' ? '#22c55e' : a.trend === 'down' ? '#ef4444' : '#94a3b8' },
           ].map(({ label, val, val2, sub, color }) => (
             <div key={label} style={{ background: '#0d1117', borderRadius: 10, border: '1px solid #1e2a3a', padding: '10px 12px' }}>
               <div style={{ fontSize: 9, color: '#475569', marginBottom: 4 }}>{label}</div>
