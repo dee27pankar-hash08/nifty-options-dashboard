@@ -597,15 +597,40 @@ function getRec(rows, spot, a, vix, candles5, belowPDLStreak) {
     if (timeScore === 0) return { type: 'No Trade', logic: 'TREND MODE: After 2 PM IST — no new trend entries. Theta risk too high.' }
 
     // ── 5-min momentum alignment ─────────────────────────────────────────────
+    // Single-candle check isn't enough: a big breakdown candle followed by a
+    // tiny green tick would still pass "last candle bullish" while the real
+    // move is down. Check NET direction over the last 2 candles too — if the
+    // net 2-candle move opposes the trade direction by a meaningful amount,
+    // block regardless of what the very last candle looks like.
     let momentumBearish = null, momentumBullish = null, momentumNote = ''
     if (candles5 && candles5.length >= 2) {
       const lc5 = candles5[candles5.length - 1]
       const pc5 = candles5[candles5.length - 2]
       const lOpen = lc5[1], lClose = lc5[4], pClose = pc5[4]
-      momentumBearish = lClose < lOpen || lClose < pClose
-      momentumBullish = lClose > lOpen || lClose > pClose
-      const candleDir = lClose < lOpen ? '🔴 bearish' : lClose > lOpen ? '🟢 bullish' : '⬜ flat'
-      momentumNote = ` 5-min candle ${candleDir} (${lClose.toFixed(0)} vs open ${lOpen.toFixed(0)}).`
+      const minMove = spot * 0.0005  // ~0.05% — small but meaningful net move
+
+      const lastBearish = lClose < lOpen || lClose < pClose
+      const lastBullish = lClose > lOpen || lClose > pClose
+
+      // Net move across the last 2 candles (from open of pc5 to close of lc5)
+      const net2 = lClose - pc5[1]
+      const net2Bearish = net2 < -minMove
+      const net2Bullish = net2 > minMove
+
+      // Bearish momentum confirmed if last candle bearish OR net-2 trending down
+      momentumBearish = lastBearish || net2Bearish
+      // But block bearish if net-2 strongly bullish despite a small red tick
+      if (net2Bullish && !lastBearish) momentumBearish = false
+
+      momentumBullish = lastBullish || net2Bullish
+      if (net2Bearish && !lastBullish) momentumBullish = false
+      // A strongly bearish net-2 always overrides a small bullish last candle
+      if (net2Bearish) momentumBullish = false
+      if (net2Bullish) momentumBearish = false
+
+      const candleDir = lClose < lOpen ? '🔴' : lClose > lOpen ? '🟢' : '⬜'
+      const netDir = net2Bearish ? 'net 2-candle ↓' : net2Bullish ? 'net 2-candle ↑' : 'net 2-candle flat'
+      momentumNote = ` 5-min candle ${candleDir} (${lClose.toFixed(0)}), ${netDir} (${net2 >= 0 ? '+' : ''}${net2.toFixed(0)}pts).`
     }
 
     // ── OI STRUCTURE (the gradient) ──────────────────────────────────────────
@@ -1010,7 +1035,11 @@ export default function App() {
             )}
             {data.rec.ceLtp && <div style={{ marginTop: 8, fontSize: 11, color: '#475569' }}>CE ₹{data.rec.ceLtp} + PE ₹{data.rec.peLtp}</div>}
             <div style={{ marginTop: 8, fontSize: 11, color: '#475569', fontStyle: 'italic' }}>{data.rec.logic}</div>
-            {data.rec.confirmed === false && <div style={{ marginTop: 4, fontSize: 11, color: '#fb923c' }}>⚠ Unconfirmed breakdown — wait for next refresh to confirm</div>}
+            {data.rec.confirmed === false && (
+              <div style={{ marginTop: 4, fontSize: 11, color: '#fb923c' }}>
+                ⚠ Unconfirmed {data.rec.type === 'PE Buy' ? 'breakdown' : data.rec.type === 'CE Buy' ? 'breakout' : 'signal'} — OI structure doesn't fully support direction, size down or wait
+              </div>
+            )}
             {data.rec.lowQ && <div style={{ marginTop: 4, fontSize: 11, color: '#fb923c' }}>⚠ Far-OTM only within budget</div>}
             {data.dte <= 2 && !['No Trade', 'Wait'].includes(data.rec.type) && <div style={{ marginTop: 4, fontSize: 11, color: '#fb923c' }}>⚠ {data.dte}d to expiry — steep theta</div>}
 
