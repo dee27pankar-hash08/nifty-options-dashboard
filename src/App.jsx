@@ -253,30 +253,46 @@ function getTrend(candles, spot) {
   if (!candles || candles.length < 2) return { trend: 'unknown', trendVote: 0, timeWarning: null }
   const lc = safe(() => candles[candles.length - 1][4], spot)
   const pc = safe(() => candles[candles.length - 2][4], spot)
+  const p2c = candles.length >= 3 ? safe(() => candles[candles.length - 3][4], pc) : pc
 
-  // Net move over the last 3 candles — captures the dominant recent direction
-  // rather than just the last pair. A big drop followed by a tiny uptick
-  // (lc > pc) should still register as "down" if the net 3-candle move is down.
+  // Net move over last 3 candles (from open of 3rd-to-last to close of last)
   const idx3 = candles.length - 4
   const c3 = idx3 >= 0 ? safe(() => candles[idx3][4], lc) : pc
   const net3 = lc - c3
-  const minMove = spot * 0.001  // ~0.1% — meaningful net move threshold
+  // Recent 2-candle net (more responsive to V-shaped bounces)
+  const net2 = lc - p2c
+  const minMove = spot * 0.001  // ~0.1% threshold
 
   let trend, trendVote
-  if (Math.abs(net3) > minMove) {
+
+  // If last 2 candles are both moving strongly in the SAME direction,
+  // that recent momentum overrides the net-3 (catches V-recoveries like today)
+  const bothUp = lc > pc && pc > p2c && net2 > minMove
+  const bothDown = lc < pc && pc < p2c && net2 < -minMove
+
+  if (bothUp) {
+    // Last 2 candles both up — strong recent bullish momentum
+    trend = 'up'
+    trendVote = Math.abs(net2) > minMove * 2 ? 0.4 : 0.25
+  } else if (bothDown) {
+    // Last 2 candles both down — strong recent bearish momentum
+    trend = 'down'
+    trendVote = -(Math.abs(net2) > minMove * 2 ? 0.4 : 0.25)
+  } else if (Math.abs(net3) > minMove) {
+    // No clear 2-candle streak — fall back to net-3 direction
     trend = net3 > 0 ? 'up' : 'down'
-    trendVote = net3 > 0 ? 0.3 : -0.3
+    trendVote = net3 > 0 ? 0.2 : -0.2
   } else {
-    // Net-3 is flat — fall back to last-pair, but weaker conviction
+    // Everything flat — use last single candle as weak signal
     trend = lc > pc ? 'up' : lc < pc ? 'down' : 'flat'
-    trendVote = lc > pc ? 0.15 : lc < pc ? -0.15 : 0
+    trendVote = lc > pc ? 0.1 : lc < pc ? -0.1 : 0
   }
 
   const mins = getISTMins()
   let timeWarning = null
   if (mins < 9 * 60 + 45) timeWarning = 'Opening volatility (9:15–9:45 IST) — wait for settlement'
   else if (mins > 14 * 60 + 45) timeWarning = 'Last 45 mins — theta collapse, avoid buying options'
-  return { trend, trendVote, timeWarning, lc, pc, c3, net3 }
+  return { trend, trendVote, timeWarning, lc, pc, c3, net3, net2 }
 }
 
 // ── ANALYSIS ──────────────────────────────────────────────────────────────────
@@ -718,22 +734,24 @@ function getRec(rows, spot, a, vix, candles5, belowPDLStreak) {
         return { type: 'Wait', logic: `TREND (${regime}): Bearish but${momentumNote} Retracement up — wait for bearish 5-min candle before PE entry.` }
       }
       // OI structure gate: is there room to fall? (headroom down to next support cluster)
-      let structNote = '', confirmed = false
+      let confirmed = false
       if (oi.ok) {
-        // Confirmation: OI gradient agrees (structVote bearish) OR fresh CE writing above (flowVote bearish)
         const structAgrees = oi.structVote < -0.1 || oi.flowVote < -0.15
-        // Headroom: at least 40pts to next support cluster (room for the move)
         const hasRoom = oi.headroomDown >= 40
         confirmed = structAgrees && hasRoom && momentumBearish !== false
-        const supTxt = oi.nearestSup ? `support cluster ${oi.nearestSup.strike} (${Math.round(oi.headroomDown)}pts away, ${fmtOI(oi.nearestSup.oi)})` : 'no nearby support'
-        structNote = ` ${structAgrees ? '✓' : '⚠'} OI ${oi.structVote < -0.1 ? 'gradient bearish' : oi.flowVote < -0.15 ? 'fresh CE writing above' : 'gradient neutral'}, next ${supTxt}.`
         if (!hasRoom) {
           return { type: 'No Trade', logic: `TREND (${regime}): Bearish but spot sitting on support cluster ${oi.nearestSup?.strike} (${Math.round(oi.headroomDown)}pts) — no room to fall, wait for breakdown.` }
         }
       }
+      const supTxt = oi.ok && oi.nearestSup ? `support cluster ${oi.nearestSup.strike} (${Math.round(oi.headroomDown)}pts away, ${fmtOI(oi.nearestSup.oi)})` : 'no nearby support'
+      const gradientNote = oi.ok ? (oi.structVote < -0.1 ? 'gradient bearish' : oi.flowVote < -0.15 ? 'fresh CE writing above' : 'gradient neutral') : 'no OI data'
+
+      if (!confirmed) {
+        return { type: 'Wait', logic: `TREND (${regime}): Bearish but unconfirmed — OI ${gradientNote}, next ${supTxt}. No edge for entry, wait for OI to align or price to react at ${oi.nearestSup?.strike || 'next level'}.${momentumNote}${timeNote}` }
+      }
       const d = pick('pe')
       return { type: 'PE Buy', ...d, confirmed,
-        logic: `TREND (${regime}): Bearish.${structNote}${momentumNote}${timeNote}` }
+        logic: `TREND (${regime}): Bearish. ✓ OI ${gradientNote}, next ${supTxt}.${momentumNote}${timeNote}` }
     }
 
     // ── BULLISH TREND → CE Buy ───────────────────────────────────────────────
@@ -741,20 +759,24 @@ function getRec(rows, spot, a, vix, candles5, belowPDLStreak) {
       if (momentumBullish === false) {
         return { type: 'Wait', logic: `TREND (${regime}): Bullish but${momentumNote} Retracement down — wait for bullish 5-min candle before CE entry.` }
       }
-      let structNote = '', confirmed = false
+      let confirmed = false
       if (oi.ok) {
         const structAgrees = oi.structVote > 0.1 || oi.flowVote > 0.15
         const hasRoom = oi.headroomUp >= 40
         confirmed = structAgrees && hasRoom && momentumBullish !== false
-        const resTxt = oi.nearestRes ? `resistance cluster ${oi.nearestRes.strike} (${Math.round(oi.headroomUp)}pts away, ${fmtOI(oi.nearestRes.oi)})` : 'no nearby resistance'
-        structNote = ` ${structAgrees ? '✓' : '⚠'} OI ${oi.structVote > 0.1 ? 'gradient bullish' : oi.flowVote > 0.15 ? 'fresh PE writing below' : 'gradient neutral'}, next ${resTxt}.`
         if (!hasRoom) {
           return { type: 'No Trade', logic: `TREND (${regime}): Bullish but spot sitting under resistance cluster ${oi.nearestRes?.strike} (${Math.round(oi.headroomUp)}pts) — no room to rise, wait for breakout.` }
         }
       }
+      const resTxt = oi.ok && oi.nearestRes ? `resistance cluster ${oi.nearestRes.strike} (${Math.round(oi.headroomUp)}pts away, ${fmtOI(oi.nearestRes.oi)})` : 'no nearby resistance'
+      const gradientNote = oi.ok ? (oi.structVote > 0.1 ? 'gradient bullish' : oi.flowVote > 0.15 ? 'fresh PE writing below' : 'gradient neutral') : 'no OI data'
+
+      if (!confirmed) {
+        return { type: 'Wait', logic: `TREND (${regime}): Bullish but unconfirmed — OI ${gradientNote}, next ${resTxt}. No edge for entry, wait for OI to align or price to react at ${oi.nearestRes?.strike || 'next level'}.${momentumNote}${timeNote}` }
+      }
       const d = pick('ce')
       return { type: 'CE Buy', ...d, confirmed,
-        logic: `TREND (${regime}): Bullish.${structNote}${momentumNote}${timeNote}` }
+        logic: `TREND (${regime}): Bullish. ✓ OI ${gradientNote}, next ${resTxt}.${momentumNote}${timeNote}` }
     }
 
     return { type: 'No Trade', logic: `TREND MODE (${regime}): Direction unclear. Wait for confirmation.` }
@@ -1065,13 +1087,75 @@ export default function App() {
           ))}
         </div>
 
+        {/* Open Position Tracker — shows status of any trade with no exit logged yet */}
+        {(() => {
+          const openPos = tradeLog.find(t => t.pnl === null && t.exitPrice === null)
+          if (!openPos || !data?.rows) return null
+
+          const side = openPos.signal === 'CE Buy' ? 'ce' : 'pe'
+          const row = data.rows.find(r => r.strike === openPos.strike)
+          const liveLTP = row ? row[`${side}_ltp`] : null
+          const livePnl = liveLTP != null ? Math.round((liveLTP - openPos.entryLTP) * LOT) : null
+
+          const distToSL = liveLTP != null && openPos.sl != null ? +(liveLTP - openPos.sl).toFixed(1) : null
+          const distToTGT = liveLTP != null && openPos.target != null ? +(openPos.target - liveLTP).toFixed(1) : null
+          const nearSL = distToSL != null && distToSL <= (openPos.entryLTP - openPos.sl) * 0.25
+          const nearTGT = distToTGT != null && distToTGT <= (openPos.target - openPos.entryLTP) * 0.25
+
+          // Thesis check: has the regime changed since entry, or flipped direction?
+          const currentRegime = data.a?.regime || '—'
+          const regimeChanged = openPos.regime && currentRegime !== '—' && openPos.regime !== currentRegime
+          const oppositeSignalNow = data.rec && (
+            (openPos.signal === 'CE Buy' && data.rec.type === 'PE Buy') ||
+            (openPos.signal === 'PE Buy' && data.rec.type === 'CE Buy')
+          )
+
+          return (
+            <div style={{ margin: '10px 12px 0', padding: 16, background: '#0d1117', borderRadius: 12, border: `2px solid ${livePnl >= 0 ? '#22c55e' : '#ef4444'}88` }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                <div style={{ fontSize: 10, color: '#475569', fontWeight: 700 }}>YOUR OPEN POSITION</div>
+                <div style={{ fontSize: 10, color: '#334155' }}>{openPos.time} · entered {openPos.regime}</div>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+                <div>
+                  <span style={{ fontSize: 16, fontWeight: 800, color: openPos.signal === 'CE Buy' ? '#22c55e' : '#ef4444' }}>{openPos.signal}</span>
+                  <span style={{ fontSize: 14, color: '#e2e8f0', marginLeft: 8 }}>{openPos.strike}{openPos.signal === 'CE Buy' ? 'C' : 'P'}</span>
+                </div>
+                {livePnl != null && (
+                  <div style={{ fontSize: 18, fontWeight: 800, color: livePnl >= 0 ? '#22c55e' : '#ef4444' }}>
+                    {livePnl >= 0 ? '+' : ''}₹{livePnl.toLocaleString('en-IN')}
+                  </div>
+                )}
+              </div>
+              <div style={{ fontSize: 11, color: '#64748b', marginTop: 6 }}>
+                Entry ₹{openPos.entryLTP} → LTP {liveLTP != null ? `₹${liveLTP}` : '—'}
+                {openPos.sl != null && <span> · SL ₹{openPos.sl}</span>}
+                {openPos.target != null && <span> · TGT ₹{openPos.target}</span>}
+              </div>
+              {nearSL && (
+                <div style={{ marginTop: 8, fontSize: 11, color: '#ef4444', fontWeight: 600 }}>⚠ Close to SL ({distToSL} pts away) — watch closely</div>
+              )}
+              {nearTGT && !nearSL && (
+                <div style={{ marginTop: 8, fontSize: 11, color: '#22c55e', fontWeight: 600 }}>✓ Approaching target ({distToTGT} pts away) — consider booking</div>
+              )}
+              {regimeChanged && (
+                <div style={{ marginTop: 8, fontSize: 11, color: '#fb923c' }}>⚠ Thesis check: regime was {openPos.regime} at entry, now {currentRegime} — re-evaluate</div>
+              )}
+              {oppositeSignalNow && (
+                <div style={{ marginTop: 8, fontSize: 11, color: '#fb923c', fontWeight: 600 }}>⚠ Fresh scan below is now showing the OPPOSITE side — market may be reversing</div>
+              )}
+            </div>
+          )
+        })()}
+
         {/* Trade */}
         {data.rec && (
           <div style={{ margin: '10px 12px 0', padding: 16, background: '#0d1117', borderRadius: 12, border: `1px solid ${RC[data.rec.type] || '#334155'}55` }}>
-            <div style={{ fontSize: 10, color: '#475569', marginBottom: 10 }}>RECOMMENDED TRADE · Budget ₹{BUDGET.toLocaleString('en-IN')}</div>
+            <div style={{ fontSize: 10, color: '#475569', marginBottom: 10 }}>{tradeLog.some(t => t.pnl === null && t.exitPrice === null) ? 'FRESH SIGNAL (current scan)' : 'RECOMMENDED TRADE'} · Budget ₹{BUDGET.toLocaleString('en-IN')}</div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <div>
                 <div style={{ fontFamily: "'Syne',sans-serif", fontWeight: 800, fontSize: 20, color: RC[data.rec.type] || '#64748b' }}>{data.rec.type}</div>
+
                 {data.rec.isReversal && (
                   <div style={{ fontSize: 10, fontWeight: 700, marginTop: 3, color: REVERSAL_COL[data.rec.reversalType] || '#94a3b8' }}>
                     ↩ {data.rec.reversalType} · 5-min confirmed
