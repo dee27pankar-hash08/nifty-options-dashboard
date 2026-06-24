@@ -266,20 +266,24 @@ function getTrend(candles, spot) {
   let trend, trendVote
 
   // If last 2 candles are both moving strongly in the SAME direction,
-  // that recent momentum overrides the net-3 (catches V-recoveries like today)
+  // that recent momentum overrides the net-3 (catches V-shaped bounces)
   const bothUp = lc > pc && pc > p2c && net2 > minMove
   const bothDown = lc < pc && pc < p2c && net2 < -minMove
 
-  if (bothUp) {
-    // Last 2 candles both up — strong recent bullish momentum
+  // Single strong candle override: >0.15% move on the last candle alone
+  // Catches sharp single-candle recoveries where previous candle was flat/bottom
+  const strongThresh = spot * 0.0015  // ~35pts at 23900
+  const strongUp = (lc - pc) > strongThresh
+  const strongDown = (pc - lc) > strongThresh
+
+  if (bothUp || strongUp) {
     trend = 'up'
-    trendVote = Math.abs(net2) > minMove * 2 ? 0.4 : 0.25
-  } else if (bothDown) {
-    // Last 2 candles both down — strong recent bearish momentum
+    trendVote = bothUp ? 0.4 : 0.25
+  } else if (bothDown || strongDown) {
     trend = 'down'
-    trendVote = -(Math.abs(net2) > minMove * 2 ? 0.4 : 0.25)
+    trendVote = -(bothDown ? 0.4 : 0.25)
   } else if (Math.abs(net3) > minMove) {
-    // No clear 2-candle streak — fall back to net-3 direction
+    // No clear recent signal — fall back to net-3 direction
     trend = net3 > 0 ? 'up' : 'down'
     trendVote = net3 > 0 ? 0.2 : -0.2
   } else {
