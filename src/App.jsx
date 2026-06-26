@@ -588,6 +588,20 @@ function detectReversal(spot, oiData, candles5, rows) {
   return null
 }
 
+// ── ATM PRICE CROSSOVER ───────────────────────────────────────────────────────
+// Generates a Buy Call signal when ATM Call price crosses above ATM Put price,
+// and a Buy Put signal when ATM Put price crosses above ATM Call price.
+// This is independent of OI-based signals.
+function detectATMCrossover(prevCeLtp, prevPeLtp, currCeLtp, currPeLtp) {
+  if (prevCeLtp == null || prevPeLtp == null) return null
+  if (!currCeLtp || !currPeLtp) return null
+  if (prevCeLtp <= prevPeLtp && currCeLtp > currPeLtp)
+    return { type: 'CE Buy', reason: `ATM Call ₹${currCeLtp.toFixed(2)} crossed above ATM Put ₹${currPeLtp.toFixed(2)}` }
+  if (prevPeLtp <= prevCeLtp && currPeLtp > currCeLtp)
+    return { type: 'PE Buy', reason: `ATM Put ₹${currPeLtp.toFixed(2)} crossed above ATM Call ₹${currCeLtp.toFixed(2)}` }
+  return null
+}
+
 // ── RECOMMENDATION ────────────────────────────────────────────────────────────
 function getRec(rows, spot, a, vix, candles5, belowPDLStreak) {
   if (!a) return { type: 'No Trade', logic: 'Analysis unavailable' }
@@ -826,6 +840,11 @@ export default function App() {
   const [exitingId, setExitingId] = useState(null)
   const [exitInput, setExitInput] = useState('')
   const belowPDLRef = useRef(0)
+  const prevATMRef = useRef({ ceLtp: null, peLtp: null })
+  const [atmSignals, setAtmSignals] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('nifty_atm_signals') || '[]') } catch { return [] }
+  })
+  const [showAtmLog, setShowAtmLog] = useState(true)
   const [tradeLog, setTradeLog] = useState(() => {
     try { return JSON.parse(localStorage.getItem('nifty_tradelog') || '[]') } catch { return [] }
   })
@@ -902,7 +921,34 @@ export default function App() {
 
       const a = safe(() => analyse(rows, spot, dte, oiData, vix, pdh, pdl, ic, prevClose, prev2Close, ic5))
       const rec = safe(() => getRec(rows, spot, a, vix, ic5, belowPDLRef.current), { type: 'No Trade', logic: 'Analysis error' })
-      setData({ spot, rows, dte, ceW, peW, a, rec, vix, pdh, pdl, prevClose, prev2Close })
+
+      // ATM crossover detection
+      const atmRow = rows.length ? rows.reduce((b, r) => Math.abs(r.strike - spot) < Math.abs(b.strike - spot) ? r : b, rows[0]) : null
+      const atmCeLtp = atmRow?.ce_ltp ?? null
+      const atmPeLtp = atmRow?.pe_ltp ?? null
+      const { ceLtp: prevCe, peLtp: prevPe } = prevATMRef.current
+      const crossover = detectATMCrossover(prevCe, prevPe, atmCeLtp, atmPeLtp)
+      if (crossover) {
+        const sig = {
+          id: Date.now(),
+          date: new Date().toLocaleDateString('en-IN'),
+          time: new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' }),
+          type: crossover.type,
+          reason: crossover.reason,
+          strike: atmRow.strike,
+          ceLtp: atmCeLtp,
+          peLtp: atmPeLtp,
+          spot,
+        }
+        setAtmSignals(prev => {
+          const next = [sig, ...prev].slice(0, 20)
+          try { localStorage.setItem('nifty_atm_signals', JSON.stringify(next)) } catch {}
+          return next
+        })
+      }
+      prevATMRef.current = { ceLtp: atmCeLtp, peLtp: atmPeLtp }
+
+      setData({ spot, rows, dte, ceW, peW, a, rec, vix, pdh, pdl, prevClose, prev2Close, atmCeLtp, atmPeLtp, atmStrike: atmRow?.strike })
       setUpdated(new Date())
     }).catch(e => setErr(String(e?.message || e)))
       .finally(() => setLoading(false))
@@ -1244,6 +1290,107 @@ export default function App() {
             </div>
           </div>
         )}
+
+        {/* ATM Price Crossover Signals */}
+        <div style={{ margin: '10px 12px 0', background: '#0d1117', borderRadius: 12, border: '1px solid #1e3a5f', overflow: 'hidden' }}>
+          <div onClick={() => setShowAtmLog(s => !s)}
+            style={{ padding: '12px 16px', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#60a5fa' }}>ATM PRICE CROSSOVER</div>
+              <div style={{ fontSize: 9, color: '#334155', marginTop: 2 }}>Independent of OI signals · Crossover at ATM strike</div>
+            </div>
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+              {atmSignals.length > 0 && (
+                <div style={{
+                  fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 4,
+                  background: atmSignals[0].type === 'CE Buy' ? '#052e16' : '#2d0a0a',
+                  color: atmSignals[0].type === 'CE Buy' ? '#4ade80' : '#f87171',
+                }}>
+                  Latest: {atmSignals[0].type}
+                </div>
+              )}
+              <div style={{ fontSize: 11, color: '#334155' }}>{showAtmLog ? '▲' : '▼'}</div>
+            </div>
+          </div>
+
+          {showAtmLog && (
+            <div style={{ borderTop: '1px solid #1e2a3a' }}>
+              {/* Live ATM price comparison */}
+              {data.atmCeLtp != null && data.atmPeLtp != null && (
+                <div style={{ padding: '12px 16px', borderBottom: '1px solid #0f172a' }}>
+                  <div style={{ fontSize: 9, color: '#475569', marginBottom: 8 }}>ATM STRIKE {data.atmStrike} — LIVE PRICES</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr auto 1fr', gap: 6, alignItems: 'center' }}>
+                    <div style={{
+                      textAlign: 'center', padding: '10px 8px', borderRadius: 8,
+                      background: data.atmCeLtp > data.atmPeLtp ? '#052e16' : '#0d1117',
+                      border: `1px solid ${data.atmCeLtp > data.atmPeLtp ? '#22c55e55' : '#1e2a3a'}`,
+                    }}>
+                      <div style={{ fontSize: 9, color: '#4ade80', marginBottom: 4 }}>ATM CALL</div>
+                      <div style={{ fontSize: 20, fontWeight: 800, color: '#22c55e' }}>₹{data.atmCeLtp.toFixed(2)}</div>
+                    </div>
+                    <div style={{ textAlign: 'center', fontSize: 14, color: '#475569' }}>
+                      {data.atmCeLtp > data.atmPeLtp ? '>' : data.atmCeLtp < data.atmPeLtp ? '<' : '='}
+                    </div>
+                    <div style={{
+                      textAlign: 'center', padding: '10px 8px', borderRadius: 8,
+                      background: data.atmPeLtp > data.atmCeLtp ? '#2d0a0a' : '#0d1117',
+                      border: `1px solid ${data.atmPeLtp > data.atmCeLtp ? '#ef444455' : '#1e2a3a'}`,
+                    }}>
+                      <div style={{ fontSize: 9, color: '#f87171', marginBottom: 4 }}>ATM PUT</div>
+                      <div style={{ fontSize: 20, fontWeight: 800, color: '#ef4444' }}>₹{data.atmPeLtp.toFixed(2)}</div>
+                    </div>
+                  </div>
+                  <div style={{ marginTop: 8, fontSize: 10, textAlign: 'center', color: '#475569' }}>
+                    {data.atmCeLtp > data.atmPeLtp
+                      ? <span style={{ color: '#22c55e' }}>Call premium dominant — bullish sentiment</span>
+                      : data.atmPeLtp > data.atmCeLtp
+                        ? <span style={{ color: '#ef4444' }}>Put premium dominant — bearish sentiment</span>
+                        : <span style={{ color: '#94a3b8' }}>Call = Put — neutral</span>}
+                  </div>
+                </div>
+              )}
+
+              {/* Signal history */}
+              <div style={{ padding: '8px 12px' }}>
+                {atmSignals.length === 0 && (
+                  <div style={{ fontSize: 11, color: '#334155', padding: '8px 0' }}>
+                    No crossover signals yet this session. Signals fire when ATM Call and Put prices cross.
+                  </div>
+                )}
+                {atmSignals.map((s, i) => (
+                  <div key={s.id} style={{ padding: '10px 0', borderBottom: i < atmSignals.length - 1 ? '1px solid #0f172a' : 'none' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                      <div>
+                        <span style={{
+                          fontSize: 12, fontWeight: 800,
+                          color: s.type === 'CE Buy' ? '#22c55e' : '#ef4444',
+                        }}>
+                          {s.type === 'CE Buy' ? '▲ BUY CALL' : '▼ BUY PUT'}
+                        </span>
+                        <span style={{ fontSize: 11, color: '#64748b', marginLeft: 8 }}>{s.strike}{s.type === 'CE Buy' ? 'C' : 'P'}</span>
+                      </div>
+                      <div style={{ textAlign: 'right', fontSize: 10, color: '#475569' }}>
+                        <div>{s.time}</div>
+                        <div style={{ color: '#334155' }}>{s.date}</div>
+                      </div>
+                    </div>
+                    <div style={{ fontSize: 11, color: '#475569', marginTop: 4 }}>{s.reason}</div>
+                    <div style={{ fontSize: 10, color: '#334155', marginTop: 2 }}>
+                      Nifty ₹{s.spot?.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                      {' · '}CE ₹{s.ceLtp?.toFixed(2)} · PE ₹{s.peLtp?.toFixed(2)}
+                    </div>
+                  </div>
+                ))}
+                {atmSignals.length > 0 && (
+                  <button onClick={e => { e.stopPropagation(); setAtmSignals([]); try { localStorage.removeItem('nifty_atm_signals') } catch {} }}
+                    style={{ marginTop: 8, background: 'transparent', border: '1px solid #1e2a3a', borderRadius: 4, color: '#334155', padding: '4px 10px', fontSize: 10, cursor: 'pointer', fontFamily: 'inherit' }}>
+                    Clear signals
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
 
         {/* Trade Log */}
         <div style={{ margin: '10px 12px 0', background: '#0d1117', borderRadius: 12, border: '1px solid #1e2a3a', overflow: 'hidden' }}>
