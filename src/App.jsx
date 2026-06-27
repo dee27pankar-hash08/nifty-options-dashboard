@@ -822,6 +822,50 @@ function getRec(rows, spot, a, vix, candles5, belowPDLStreak) {
   const d = pick('pe'); return { type: 'PE Buy', ...d, logic: `${bias} bias.` }
 }
 
+// ── COMBINED SIGNAL (OI + ATM Price Crossover) ────────────────────────────────
+// Blends the OI-based weighted score with the ATM premium differential to
+// produce a higher-conviction directional signal. A recent ATM crossover that
+// agrees with the direction earns a confidence boost.
+function getCombinedSignal(a, atmCeLtp, atmPeLtp, recentCrossoverType) {
+  if (!a || atmCeLtp == null || atmPeLtp == null) return null
+
+  // ATM premium differential: CE > PE = call-heavy = bullish, PE > CE = bearish
+  const total = atmCeLtp + atmPeLtp
+  const atmRaw = total > 0 ? (atmCeLtp - atmPeLtp) / total : 0
+  // Amplify — CE/PE typically differ by 5-20%, scale to -1..+1
+  const atmVote = clip(atmRaw * 8)
+
+  // OI analysis composite score (9 sub-signals already blended), -1..+1
+  const oiVote = a.score
+
+  // Both signals must point the same direction to be "aligned"
+  const aligned = (oiVote > 0.05 && atmVote > 0) || (oiVote < -0.05 && atmVote < 0)
+
+  // Weighted blend: OI carries richer multi-signal info, ATM is fast-moving price signal
+  const combined = oiVote * 0.55 + atmVote * 0.45
+
+  // Crossover bonus: if a fresh ATM crossover agrees with the blended direction
+  const crossoverAgrees = recentCrossoverType === 'CE Buy' ? combined > 0
+    : recentCrossoverType === 'PE Buy' ? combined < 0
+    : false
+  const boost = crossoverAgrees ? (combined >= 0 ? 0.12 : -0.12) : 0
+  const finalScore = clip(combined + boost)
+
+  const abs = Math.abs(finalScore)
+  const type = finalScore > 0 ? 'CE Buy' : 'PE Buy'
+
+  if (!aligned) {
+    return { type: 'Conflicting', aligned: false, oiVote, atmVote, finalScore, crossoverAgrees }
+  }
+  if (abs < 0.08) {
+    return { type: 'No Signal', aligned, oiVote, atmVote, finalScore, crossoverAgrees }
+  }
+
+  const strength = abs >= 0.42 ? 'STRONG' : abs >= 0.22 ? 'MODERATE' : 'WEAK'
+  const conv = Math.round(abs * 100)
+  return { type, strength, conv, finalScore, oiVote, atmVote, aligned, crossoverAgrees }
+}
+
 // ── CONSTANTS ─────────────────────────────────────────────────────────────────
 const BC = { BULLISH: '#22c55e', 'CAUTIOUSLY BULLISH': '#86efac', 'CAUTIOUSLY BEARISH': '#fb923c', BEARISH: '#ef4444', NEUTRAL: '#94a3b8' }
 const RC = { 'CE Buy': '#22c55e', 'PE Buy': '#ef4444', Straddle: '#fb923c', 'No Trade': '#64748b', Wait: '#f59e0b' }
@@ -948,7 +992,10 @@ export default function App() {
       }
       prevATMRef.current = { ceLtp: atmCeLtp, peLtp: atmPeLtp }
 
-      setData({ spot, rows, dte, ceW, peW, a, rec, vix, pdh, pdl, prevClose, prev2Close, atmCeLtp, atmPeLtp, atmStrike: atmRow?.strike })
+      // Combined OI + ATM signal — crossover bonus applies only if one fired this cycle
+      const combinedSignal = safe(() => getCombinedSignal(a, atmCeLtp, atmPeLtp, crossover?.type ?? null))
+
+      setData({ spot, rows, dte, ceW, peW, a, rec, vix, pdh, pdl, prevClose, prev2Close, atmCeLtp, atmPeLtp, atmStrike: atmRow?.strike, combinedSignal })
       setUpdated(new Date())
     }).catch(e => setErr(String(e?.message || e)))
       .finally(() => setLoading(false))
@@ -1194,6 +1241,84 @@ export default function App() {
               {oppositeSignalNow && (
                 <div style={{ marginTop: 8, fontSize: 11, color: '#fb923c', fontWeight: 600 }}>⚠ Fresh scan below is now showing the OPPOSITE side — market may be reversing</div>
               )}
+            </div>
+          )
+        })()}
+
+        {/* Combined Signal — OI + ATM crossover */}
+        {data.combinedSignal && (() => {
+          const cs = data.combinedSignal
+          const isActionable = cs.aligned && cs.type !== 'No Signal'
+          const sigColor = cs.type === 'CE Buy' ? '#22c55e' : cs.type === 'PE Buy' ? '#ef4444' : '#475569'
+          const strengthBg = cs.strength === 'STRONG' ? '#14532d' : cs.strength === 'MODERATE' ? '#1c2a1c' : '#1c1917'
+          const strengthCol = cs.strength === 'STRONG' ? '#4ade80' : cs.strength === 'MODERATE' ? '#86efac' : '#a8a29e'
+          return (
+            <div style={{
+              margin: '10px 12px 0', padding: 16, background: '#0d1117', borderRadius: 12,
+              border: `2px solid ${isActionable ? sigColor + '55' : '#1e2a3a'}`,
+            }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
+                <div>
+                  <div style={{ fontSize: 9, color: '#60a5fa', marginBottom: 4, fontWeight: 700, letterSpacing: 1 }}>
+                    COMBINED SIGNAL · OI + ATM PRICE
+                  </div>
+                  {isActionable ? (
+                    <div style={{ fontFamily: "'Syne',sans-serif", fontWeight: 800, fontSize: 22, color: sigColor, lineHeight: 1 }}>
+                      {cs.type === 'CE Buy' ? '▲ BUY CALL' : '▼ BUY PUT'}
+                    </div>
+                  ) : (
+                    <div style={{ fontFamily: "'Syne',sans-serif", fontWeight: 800, fontSize: 16, color: '#475569', lineHeight: 1 }}>
+                      {cs.type === 'No Signal' ? 'NO SIGNAL' : 'SIGNALS CONFLICTING'}
+                    </div>
+                  )}
+                </div>
+                {isActionable && (
+                  <div style={{ textAlign: 'right' }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, padding: '4px 10px', borderRadius: 6, background: strengthBg, color: strengthCol }}>
+                      {cs.strength}
+                    </div>
+                    <div style={{ fontSize: 10, color: '#475569', marginTop: 4 }}>{cs.conv}% conviction</div>
+                  </div>
+                )}
+              </div>
+
+              {/* Three-column score breakdown */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 14px 1fr 14px 1fr', gap: 4, alignItems: 'center' }}>
+                {[
+                  { label: 'OI ANALYSIS', vote: cs.oiVote, sub: cs.oiVote > 0.05 ? 'bullish' : cs.oiVote < -0.05 ? 'bearish' : 'neutral' },
+                  null,
+                  { label: 'ATM PREMIUM', vote: cs.atmVote, sub: cs.atmVote > 0 ? 'CE dominant' : cs.atmVote < 0 ? 'PE dominant' : 'neutral' },
+                  null,
+                  { label: 'COMBINED', vote: cs.finalScore, sub: isActionable ? cs.strength : cs.type === 'Conflicting' ? 'split' : '—', highlight: true },
+                ].map((col, i) => col === null ? (
+                  <div key={i} style={{ textAlign: 'center', fontSize: 12, color: '#334155', fontWeight: 700 }}>+</div>
+                ) : (
+                  <div key={i} style={{
+                    background: col.highlight && isActionable ? (cs.type === 'CE Buy' ? '#052e16' : '#2d0a0a') : '#0a0f1a',
+                    borderRadius: 8, padding: '8px 4px', textAlign: 'center',
+                    border: col.highlight && isActionable ? `1px solid ${sigColor}33` : '1px solid #1e2a3a',
+                  }}>
+                    <div style={{ fontSize: 9, color: '#475569', marginBottom: 3 }}>{col.label}</div>
+                    <div style={{ fontSize: 15, fontWeight: 800, color: col.vote > 0.05 ? '#22c55e' : col.vote < -0.05 ? '#ef4444' : '#94a3b8' }}>
+                      {col.vote >= 0 ? '+' : ''}{(col.vote * 100).toFixed(0)}%
+                    </div>
+                    <div style={{ fontSize: 9, color: '#334155', marginTop: 2 }}>{col.sub}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Status line */}
+              <div style={{ marginTop: 10, fontSize: 11 }}>
+                {cs.crossoverAgrees && (
+                  <div style={{ color: '#22c55e', fontWeight: 600 }}>✓ ATM price crossover just fired in the same direction — high conviction</div>
+                )}
+                {cs.aligned && !cs.crossoverAgrees && (
+                  <div style={{ color: '#64748b' }}>OI and ATM premium both point {cs.type === 'CE Buy' ? 'bullish' : 'bearish'} — no fresh crossover this cycle</div>
+                )}
+                {!cs.aligned && (
+                  <div style={{ color: '#fb923c' }}>⚠ OI and ATM premium are pointing in opposite directions — wait for alignment before trading</div>
+                )}
+              </div>
             </div>
           )
         })()}
