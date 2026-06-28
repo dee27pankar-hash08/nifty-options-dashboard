@@ -9,7 +9,7 @@ const api = async (endpoint, params = {}) => {
 }
 
 const todayStr = () => new Date().toISOString().split('T')[0]
-const NTM = 500, LOT = 65, BUDGET = 10000
+const NTM = 500, LOT = 65
 const clip = (x, lo = -1, hi = 1) => Math.max(lo, Math.min(hi, x))
 const fmtOI = v => Math.abs(v) >= 1e6 ? `${(v / 1e6).toFixed(2)}M` : `${(v / 1e3).toFixed(0)}K`
 const safe = (fn, fallback = null) => { try { return fn() } catch { return fallback } }
@@ -615,7 +615,7 @@ function getRec(rows, spot, a, vix, candles5, belowPDLStreak) {
     const lt = `${side}_ltp`, dl = `${side}_delta`
     const bk = `${side}_bid`, ak = `${side}_ask`
     const aff = rows
-      .filter(r => r[lt] * LOT <= BUDGET && r[lt] > 0.5)
+      .filter(r => r[lt] > 0.5)
       .map(r => ({ ...r, _ad: Math.abs(r[dl]), _sp: (r[ak] || 0) - (r[bk] || 0) }))
     if (!aff.length) return null
     const liquid = aff.filter(r => r._sp <= 15)
@@ -625,7 +625,7 @@ function getRec(rows, spot, a, vix, candles5, belowPDLStreak) {
       if (Math.abs(dd) > 0.05) return dd
       return x._sp - y._sp
     })
-    const row = cand[0], cost = row[lt] * LOT
+    const row = cand[0]
     const spread = +row._sp.toFixed(1)
     const useChannel = overrides.isChannel ?? isChannel
     const aForLevels = overrides.a || a
@@ -633,9 +633,8 @@ function getRec(rows, spot, a, vix, candles5, belowPDLStreak) {
     return {
       strike: row.strike, ltp: row[lt], delta: row[dl],
       theta: row[`${side}_theta`], iv: row[`${side}_iv`],
-      cost, lots: Math.floor(BUDGET / cost),
       moneyness: Math.round(side === 'ce' ? spot - row.strike : row.strike - spot),
-      lowQ: Math.abs(row[dl]) < 0.30, spread, spreadWide: spread > 8, levels
+      spread, spreadWide: spread > 8, levels
     }
   })
 
@@ -812,10 +811,8 @@ function getRec(rows, spot, a, vix, candles5, belowPDLStreak) {
       return { type: 'CE Buy', ...d, logic: `Prior day strongly bullish — directional CE preferred over straddle.${timeNote}` }
     }
     const sorted = [...rows].sort((x, y) => Math.abs(x.strike - spot) - Math.abs(y.strike - spot))
-    for (const r of sorted.slice(0, 8)) {
-      const c = (r.ce_ltp + r.pe_ltp) * LOT
-      if (c <= BUDGET) return { type: 'Straddle', strike: r.strike, ceLtp: r.ce_ltp, peLtp: r.pe_ltp, cost: c, lots: Math.floor(BUDGET / c), logic: 'No directional edge, no prior day bias — straddle captures move either way' }
-    }
+    const sr = sorted.find(r => r.ce_ltp > 0.5 && r.pe_ltp > 0.5)
+    if (sr) return { type: 'Straddle', strike: sr.strike, ceLtp: sr.ce_ltp, peLtp: sr.pe_ltp, logic: 'No directional edge, no prior day bias — straddle captures move either way' }
     return { type: 'No Trade', logic: 'Low conviction — stay out' }
   }
   if (bias.includes('BULLISH')) { const d = pick('ce'); return { type: 'CE Buy', ...d, logic: `${bias} bias.` } }
@@ -1326,7 +1323,7 @@ export default function App() {
         {/* Trade */}
         {data.rec && (
           <div style={{ margin: '10px 12px 0', padding: 16, background: '#0d1117', borderRadius: 12, border: `1px solid ${RC[data.rec.type] || '#334155'}55` }}>
-            <div style={{ fontSize: 10, color: '#475569', marginBottom: 10 }}>{tradeLog.some(t => t.pnl === null && t.exitPrice === null) ? 'FRESH SIGNAL (current scan)' : 'RECOMMENDED TRADE'} · Budget ₹{BUDGET.toLocaleString('en-IN')}</div>
+            <div style={{ fontSize: 10, color: '#475569', marginBottom: 10 }}>{tradeLog.some(t => t.pnl === null && t.exitPrice === null) ? 'FRESH SIGNAL (current scan)' : 'RECOMMENDED TRADE'}</div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <div>
                 <div style={{ fontFamily: "'Syne',sans-serif", fontWeight: 800, fontSize: 20, color: RC[data.rec.type] || '#64748b' }}>{data.rec.type}</div>
@@ -1338,12 +1335,6 @@ export default function App() {
                 )}
                 {data.rec.strike && <div style={{ fontSize: 22, fontWeight: 700, color: '#f8fafc', marginTop: 2 }}>{data.rec.strike}{data.rec.type === 'CE Buy' ? 'C' : data.rec.type === 'PE Buy' ? 'P' : ''}</div>}
               </div>
-              {data.rec.cost && (
-                <div style={{ textAlign: 'right' }}>
-                  <div style={{ fontSize: 14, color: '#94a3b8' }}>₹{data.rec.cost.toLocaleString('en-IN', { maximumFractionDigits: 0 })}/lot</div>
-                  <div style={{ fontSize: 16, fontWeight: 700 }}>{data.rec.lots} lot{data.rec.lots > 1 ? 's' : ''}</div>
-                </div>
-              )}
             </div>
             {data.rec.ltp && (
               <div style={{ marginTop: 8, fontSize: 11, color: '#475569' }}>
@@ -1358,7 +1349,6 @@ export default function App() {
                 ⚠ Unconfirmed {data.rec.type === 'PE Buy' ? 'breakdown' : data.rec.type === 'CE Buy' ? 'breakout' : 'signal'} — OI structure doesn't fully support direction, size down or wait
               </div>
             )}
-            {data.rec.lowQ && <div style={{ marginTop: 4, fontSize: 11, color: '#fb923c' }}>⚠ Far-OTM only within budget</div>}
 
 
             {/* Levels */}
