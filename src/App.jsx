@@ -610,6 +610,7 @@ function getRec(rows, spot, a, vix, candles5, belowPDLStreak) {
   if (vix != null && vix > 20) return { type: 'No Trade', logic: `VIX ${vix.toFixed(1)} too high — premiums too expensive` }
 
   const streak = belowPDLStreak || 0
+  const timeNote = timeScore < 1.0 ? ' Post 11 AM — consider smaller size.' : ''
 
   const pick = (side, overrides = {}) => safe(() => {
     const lt = `${side}_ltp`, dl = `${side}_delta`
@@ -727,7 +728,6 @@ function getRec(rows, spot, a, vix, candles5, belowPDLStreak) {
 
     // ── OI STRUCTURE (the gradient) ──────────────────────────────────────────
     const oi = safe(() => analyzeOIStructure(rows, spot, a.oiData), { ok: false })
-    const timeNote = timeScore < 1.0 ? ' Post 11 AM — consider smaller size.' : ''
 
     // Move exhaustion check applies to all trend trades
     const moveExhausted = a.dayRange > a.emRound * 0.85
