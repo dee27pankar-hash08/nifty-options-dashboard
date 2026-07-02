@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 
 const api = async (endpoint, params = {}) => {
   const qs = new URLSearchParams({ endpoint, ...params, _t: Date.now() }).toString()
@@ -863,6 +863,42 @@ function getCombinedSignal(a, atmCeLtp, atmPeLtp, recentCrossoverType) {
   return { type, strength, conv, finalScore, oiVote, atmVote, aligned, crossoverAgrees }
 }
 
+// ── DAILY BACKTEST (from logged trades) ──────────────────────────────────────
+// Trade log entries carry date as 'DD/MM/YYYY' (en-IN locale) — parse for sort order.
+const parseINDate = s => {
+  if (!s) return null
+  const [d, m, y] = s.split('/').map(Number)
+  return d && m && y ? new Date(y, m - 1, d) : null
+}
+
+function computeDailyStats(tradeLog) {
+  const closed = tradeLog.filter(t => t.pnl != null)
+  const openCount = tradeLog.length - closed.length
+  if (!closed.length) return { days: [], summary: null, openCount }
+
+  const byDate = {}
+  for (const t of closed) {
+    const key = t.date || 'Unknown'
+    if (!byDate[key]) byDate[key] = { date: key, trades: 0, wins: 0, losses: 0, pnl: 0 }
+    byDate[key].trades += 1
+    byDate[key].pnl += t.pnl
+    if (t.pnl > 0) byDate[key].wins += 1; else byDate[key].losses += 1
+  }
+  const days = Object.values(byDate)
+    .map(d => ({ ...d, winRate: Math.round((d.wins / d.trades) * 100) }))
+    .sort((a, b) => (parseINDate(b.date) ?? 0) - (parseINDate(a.date) ?? 0))
+
+  const totalPnl = closed.reduce((s, t) => s + t.pnl, 0)
+  const wins = closed.filter(t => t.pnl > 0).length
+  const losses = closed.length - wins
+  const winRate = Math.round((wins / closed.length) * 100)
+  const avgPnl = Math.round(totalPnl / closed.length)
+  const byPnl = [...days].sort((a, b) => b.pnl - a.pnl)
+  const bestDay = byPnl[0], worstDay = byPnl[byPnl.length - 1]
+
+  return { days, openCount, summary: { totalPnl, totalTrades: closed.length, wins, losses, winRate, avgPnl, bestDay, worstDay } }
+}
+
 // ── CONSTANTS ─────────────────────────────────────────────────────────────────
 const BC = { BULLISH: '#22c55e', 'CAUTIOUSLY BULLISH': '#86efac', 'CAUTIOUSLY BEARISH': '#fb923c', BEARISH: '#ef4444', NEUTRAL: '#94a3b8' }
 const RC = { 'CE Buy': '#22c55e', 'PE Buy': '#ef4444', Straddle: '#fb923c', 'No Trade': '#64748b', Wait: '#f59e0b' }
@@ -878,6 +914,7 @@ export default function App() {
   const [expiry, setExpiry] = useState(null)
   const [expiries, setExpiries] = useState([])
   const [showLog, setShowLog] = useState(false)
+  const [showPerf, setShowPerf] = useState(true)
   const [exitingId, setExitingId] = useState(null)
   const [exitInput, setExitInput] = useState('')
   const belowPDLRef = useRef(0)
@@ -1025,7 +1062,7 @@ export default function App() {
       exitPrice: null,
       pnl: null,
     }
-    const newLog = [entry, ...tradeLog].slice(0, 30)
+    const newLog = [entry, ...tradeLog].slice(0, 500)
     setTradeLog(newLog)
     try { localStorage.setItem('nifty_tradelog', JSON.stringify(newLog)) } catch {}
   }
@@ -1043,6 +1080,8 @@ export default function App() {
     setExitingId(null)
     setExitInput('')
   }
+
+  const perf = useMemo(() => computeDailyStats(tradeLog), [tradeLog])
 
   const a = data?.a
   const bias = a?.bias || 'NEUTRAL'
@@ -1503,6 +1542,105 @@ export default function App() {
                   </button>
                 )}
               </div>
+            </div>
+          )}
+        </div>
+
+        {/* Performance / Daily Backtest */}
+        <div style={{ margin: '10px 12px 0', background: '#0d1117', borderRadius: 12, border: '1px solid #1e2a3a', overflow: 'hidden' }}>
+          <div onClick={() => setShowPerf(s => !s)}
+            style={{ padding: '12px 16px', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#475569' }}>PERFORMANCE · DAILY BACKTEST</div>
+              <div style={{ fontSize: 9, color: '#334155', marginTop: 2 }}>Profitability of your logged trades, day by day</div>
+            </div>
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+              {perf.summary && (
+                <div style={{
+                  fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 4,
+                  background: perf.summary.totalPnl >= 0 ? '#052e16' : '#2d0a0a',
+                  color: perf.summary.totalPnl >= 0 ? '#4ade80' : '#f87171',
+                }}>
+                  {perf.summary.totalPnl >= 0 ? '+' : ''}₹{perf.summary.totalPnl.toLocaleString('en-IN')}
+                </div>
+              )}
+              <div style={{ fontSize: 11, color: '#334155' }}>{showPerf ? '▲' : '▼'}</div>
+            </div>
+          </div>
+
+          {showPerf && (
+            <div style={{ borderTop: '1px solid #1e2a3a', padding: '14px 16px' }}>
+              {!perf.summary ? (
+                <div style={{ fontSize: 11, color: '#334155', padding: '8px 0' }}>
+                  No closed trades yet. Use “Log Entry” on a recommended trade, then “Log Exit” once you close it — daily profitability will build up here automatically.
+                </div>
+              ) : (<>
+                {/* Summary tiles */}
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 14 }}>
+                  <div style={{ background: perf.summary.totalPnl >= 0 ? '#052e16' : '#2d0a0a', borderRadius: 8, padding: 10, textAlign: 'center' }}>
+                    <div style={{ fontSize: 9, color: '#475569', marginBottom: 4 }}>TOTAL P&amp;L</div>
+                    <div style={{ fontSize: 18, fontWeight: 800, color: perf.summary.totalPnl >= 0 ? '#22c55e' : '#ef4444' }}>
+                      {perf.summary.totalPnl >= 0 ? '+' : ''}₹{perf.summary.totalPnl.toLocaleString('en-IN')}
+                    </div>
+                  </div>
+                  <div style={{ background: '#0a0f1a', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #1e2a3a' }}>
+                    <div style={{ fontSize: 9, color: '#475569', marginBottom: 4 }}>WIN RATE</div>
+                    <div style={{ fontSize: 18, fontWeight: 800, color: perf.summary.winRate >= 50 ? '#22c55e' : '#fb923c' }}>{perf.summary.winRate}%</div>
+                  </div>
+                  <div style={{ background: '#0a0f1a', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #1e2a3a' }}>
+                    <div style={{ fontSize: 9, color: '#475569', marginBottom: 4 }}>CLOSED TRADES</div>
+                    <div style={{ fontSize: 18, fontWeight: 800, color: '#f8fafc' }}>{perf.summary.totalTrades}</div>
+                    <div style={{ fontSize: 9, color: '#334155', marginTop: 2 }}>{perf.summary.wins}W / {perf.summary.losses}L</div>
+                  </div>
+                  <div style={{ background: '#0a0f1a', borderRadius: 8, padding: 10, textAlign: 'center', border: '1px solid #1e2a3a' }}>
+                    <div style={{ fontSize: 9, color: '#475569', marginBottom: 4 }}>AVG P&amp;L / TRADE</div>
+                    <div style={{ fontSize: 18, fontWeight: 800, color: perf.summary.avgPnl >= 0 ? '#22c55e' : '#ef4444' }}>
+                      {perf.summary.avgPnl >= 0 ? '+' : ''}₹{perf.summary.avgPnl.toLocaleString('en-IN')}
+                    </div>
+                  </div>
+                </div>
+
+                {perf.days.length > 1 && perf.summary.bestDay && perf.summary.worstDay && (
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#334155', marginBottom: 14, flexWrap: 'wrap', gap: 6 }}>
+                    <span>Best day: <span style={{ color: '#22c55e' }}>{perf.summary.bestDay.date} ({perf.summary.bestDay.pnl >= 0 ? '+' : ''}₹{perf.summary.bestDay.pnl.toLocaleString('en-IN')})</span></span>
+                    <span>Worst day: <span style={{ color: '#ef4444' }}>{perf.summary.worstDay.date} ({perf.summary.worstDay.pnl >= 0 ? '+' : ''}₹{perf.summary.worstDay.pnl.toLocaleString('en-IN')})</span></span>
+                  </div>
+                )}
+
+                {/* Day-by-day P&L — diverging bars centered on zero */}
+                <div style={{ fontSize: 9, color: '#475569', marginBottom: 8, fontWeight: 700 }}>DAY-BY-DAY P&amp;L</div>
+                {(() => {
+                  const maxAbs = Math.max(1, ...perf.days.map(d => Math.abs(d.pnl)))
+                  return perf.days.map(d => {
+                    const pos = d.pnl >= 0
+                    const halfWidthPct = Math.min(50, (Math.abs(d.pnl) / maxAbs) * 50)
+                    return (
+                      <div key={d.date} style={{ marginBottom: 10 }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#64748b', marginBottom: 3 }}>
+                          <span>{d.date} · {d.trades} trade{d.trades > 1 ? 's' : ''} · {d.winRate}% win</span>
+                          <span style={{ fontWeight: 700, color: pos ? '#22c55e' : '#ef4444' }}>{pos ? '+' : ''}₹{d.pnl.toLocaleString('en-IN')}</span>
+                        </div>
+                        <div style={{ position: 'relative', height: 8, background: '#1e2a3a', borderRadius: 4 }}>
+                          <div style={{ position: 'absolute', left: '50%', top: 0, bottom: 0, width: 1, background: '#334155' }} />
+                          <div style={{
+                            position: 'absolute', top: 0, bottom: 0,
+                            ...(pos ? { left: '50%' } : { right: '50%' }),
+                            width: `${halfWidthPct}%`,
+                            background: pos ? '#22c55e' : '#ef4444',
+                            borderRadius: pos ? '0 4px 4px 0' : '4px 0 0 4px',
+                          }} />
+                        </div>
+                      </div>
+                    )
+                  })
+                })()}
+
+                {perf.openCount > 0 && (
+                  <div style={{ marginTop: 4, fontSize: 10, color: '#334155' }}>
+                    {perf.openCount} trade{perf.openCount > 1 ? 's' : ''} still open — excluded from stats above until exit is logged.
+                  </div>
+                )}
+              </>)}
             </div>
           )}
         </div>
