@@ -300,7 +300,11 @@ function getTrend(candles, spot) {
 }
 
 // ── ANALYSIS ──────────────────────────────────────────────────────────────────
-function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles, prevClose, prev2Close, candles5) {
+// Default signal weights — overridable at runtime via localStorage (see Algo Self-Review panel)
+const DEFAULT_WEIGHTS = { pcr: 2.0, bld: 1.5, maxPain: 1.2, walls: 2.0, skew: 1.5, vix: 1.0, pdhl: 1.5, trend: 0.8, priorDay: 2.0 }
+const SIGNAL_LABELS = { pcr: 'PCR', bld: 'OI Buildup', maxPain: 'Max Pain', walls: 'Walls', skew: 'IV Skew', vix: 'VIX', pdhl: 'PDH/PDL', trend: '30min Trend', priorDay: 'Prior Day' }
+
+function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles, prevClose, prev2Close, candles5, weights = {}) {
   const near = rows.filter(r => Math.abs(r.strike - spot) <= NTM)
   if (!near.length) return null
 
@@ -333,17 +337,19 @@ function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles, prevClose, pre
     priorReason = `Prior context: ${prevDir} · ${gapDir}`
   }
 
+  const W = { ...DEFAULT_WEIGHTS, ...weights }
   const sigs = [
-    { v: pcr.vote, w: 2.0, r: pcr.reason },
-    { v: bld.vote, w: 1.5, r: bld.reason },
-    { v: mp.vote, w: 1.2 * mp.expW, r: mp.reason },
-    { v: wall.vote, w: 2.0, r: wall.reason },
-    { v: skew.vote, w: 1.5, r: skew.reason },
-    { v: vixS.vote, w: 1.0, r: vixS.reason },
-    { v: pdhl.vote, w: 1.5, r: pdhl.reason },
-    { v: tctx.trendVote, w: 0.8, r: `30min trend ${tctx.trend} (net 3-candle ${tctx.net3 != null ? (tctx.net3 >= 0 ? '+' : '') + tctx.net3.toFixed(0) : '—'}pts, last ${tctx.lc ? tctx.lc.toFixed(0) : '—'})` },
-    { v: priorV, w: 2.0, r: priorReason },   // prior-day context — high weight, captures what intraday misses
+    { id: 'pcr', v: pcr.vote, w: W.pcr, r: pcr.reason },
+    { id: 'bld', v: bld.vote, w: W.bld, r: bld.reason },
+    { id: 'maxPain', v: mp.vote, w: W.maxPain * mp.expW, r: mp.reason },
+    { id: 'walls', v: wall.vote, w: W.walls, r: wall.reason },
+    { id: 'skew', v: skew.vote, w: W.skew, r: skew.reason },
+    { id: 'vix', v: vixS.vote, w: W.vix, r: vixS.reason },
+    { id: 'pdhl', v: pdhl.vote, w: W.pdhl, r: pdhl.reason },
+    { id: 'trend', v: tctx.trendVote, w: W.trend, r: `30min trend ${tctx.trend} (net 3-candle ${tctx.net3 != null ? (tctx.net3 >= 0 ? '+' : '') + tctx.net3.toFixed(0) : '—'}pts, last ${tctx.lc ? tctx.lc.toFixed(0) : '—'})` },
+    { id: 'priorDay', v: priorV, w: W.priorDay, r: priorReason },   // prior-day context — high weight, captures what intraday misses
   ]
+  const sigSnapshot = sigs.map(s => ({ id: s.id, v: +s.v.toFixed(3), w: +s.w.toFixed(3) }))
 
   const wsum = sigs.reduce((s, x) => s + x.w, 0)
   const score = sigs.reduce((s, x) => s + x.v * x.w, 0) / wsum
@@ -449,7 +455,7 @@ function analyse(rows, spot, dte, oiData, vix, pdh, pdl, candles, prevClose, pre
     timeWarning: tctx.timeWarning, trend: tctx.trend, tLc: tctx.lc, tPc: tctx.pc, tNet3: tctx.net3,
     em, emRound: Math.round(em),
     insidePDHL, tightRange, sustained,
-    dayRange: Math.round(dayRange), timeScore, priorV, oiData
+    dayRange: Math.round(dayRange), timeScore, priorV, oiData, sigSnapshot
   }
 }
 
@@ -914,6 +920,92 @@ function computeDailyStats(tradeLog) {
   return { days, openCount, summary: { totalPnl, totalTrades: closed.length, wins, losses, winRate, avgPnl, bestDay, worstDay } }
 }
 
+// ── ALGO SELF-REVIEW (Phase 1: scorecard, Phase 2: suggested weight/rule tuning) ──
+// Ground truth per signal = did NIFTY spot actually move the direction the signal
+// voted, from entry to exit — not option P&L, which is noisy (theta, spread, liquidity).
+// Only trades logged live by the dashboard carry sigSnapshot/exitSpot; imported
+// historical trades still count toward Performance but can't be attributed per-signal.
+const MIN_SIGNAL_N = 15       // min observations before a signal's hit-rate is trusted
+const MIN_CONFIRMED_N = 8     // min observations before confirmed-vs-not is trusted
+
+function computeSignalScorecard(tradeLog) {
+  const attributable = tradeLog.filter(t =>
+    t.sigSnapshot && t.exitSpot != null && t.spot != null &&
+    ['CE Buy', 'PE Buy'].includes(t.signal))
+
+  const bySignal = {}
+  for (const id of Object.keys(DEFAULT_WEIGHTS)) bySignal[id] = { id, label: SIGNAL_LABELS[id], n: 0, correct: 0, wrong: 0 }
+  for (const t of attributable) {
+    const moveDir = Math.sign(t.exitSpot - t.spot)
+    if (moveDir === 0) continue
+    const tradeDir = t.signal === 'CE Buy' ? 1 : -1
+    for (const s of t.sigSnapshot) {
+      if (Math.abs(s.v) <= 0.05) continue   // signal had no real opinion on this trade
+      const b = bySignal[s.id]
+      if (!b) continue
+      b.n += 1
+      b.currentWeight = s.w
+      if (Math.sign(s.v) === moveDir) b.correct += 1; else b.wrong += 1
+    }
+  }
+  const signals = Object.values(bySignal).map(b => ({
+    ...b, hitRate: b.n ? b.correct / b.n : null, currentWeight: b.currentWeight ?? DEFAULT_WEIGHTS[b.id],
+  }))
+
+  const groupBy = (items, keyFn) => {
+    const g = {}
+    for (const t of items) {
+      const key = keyFn(t)
+      if (!g[key]) g[key] = { key, n: 0, wins: 0, pnl: 0 }
+      g[key].n += 1
+      g[key].pnl += t.pnl
+      if (t.pnl > 0) g[key].wins += 1
+    }
+    return Object.values(g).map(x => ({ ...x, winRate: x.n ? x.wins / x.n : 0 }))
+  }
+  const closed = tradeLog.filter(t => t.pnl != null)
+  const byRegime = groupBy(closed, t => t.regime || '—').sort((a, b) => b.n - a.n)
+  const byConfirmed = groupBy(closed, t => t.confirmed === true ? 'Confirmed' : t.confirmed === false ? 'Unconfirmed' : 'Unspecified')
+
+  return { signals, byRegime, byConfirmed, sampleSize: attributable.length }
+}
+
+function computeSuggestions(scorecard, weightOverrides, ruleOverrides, dismissed) {
+  const isDismissed = key => dismissed.includes(key)
+  const suggestions = []
+
+  for (const s of scorecard.signals) {
+    if (s.n < MIN_SIGNAL_N) continue
+    const overridden = weightOverrides[s.id] != null
+    let suggestedWeight = null, reason = null
+    if (s.hitRate < 0.35) {
+      suggestedWeight = Math.max(0.3, +(s.currentWeight * 0.75).toFixed(2))
+      reason = `Wrong direction on ${s.wrong}/${s.n} trades (${Math.round(s.hitRate * 100)}% hit rate) — consider reducing its influence`
+    } else if (s.hitRate > 0.65) {
+      suggestedWeight = Math.min(DEFAULT_WEIGHTS[s.id] * 1.5, +(s.currentWeight * 1.15).toFixed(2))
+      reason = `Correct direction on ${s.correct}/${s.n} trades (${Math.round(s.hitRate * 100)}% hit rate) — consider increasing its influence`
+    }
+    if (suggestedWeight == null || Math.abs(suggestedWeight - s.currentWeight) < 0.05) continue
+    const key = `weight:${s.id}:${suggestedWeight}`
+    if (isDismissed(key) || overridden) continue
+    suggestions.push({ key, type: 'weight', id: s.id, label: s.label, from: s.currentWeight, to: suggestedWeight, reason })
+  }
+
+  const confMap = Object.fromEntries(scorecard.byConfirmed.map(c => [c.key, c]))
+  const conf = confMap['Confirmed'], unconf = confMap['Unconfirmed']
+  if (conf && unconf && unconf.n >= MIN_CONFIRMED_N && conf.n >= 5 &&
+      (conf.winRate - unconf.winRate) >= 0.20 && !ruleOverrides.blockUnconfirmed) {
+    const key = 'rule:blockUnconfirmed'
+    if (!isDismissed(key)) {
+      suggestions.push({
+        key, type: 'rule', id: 'blockUnconfirmed', label: 'Block unconfirmed entries',
+        reason: `Unconfirmed trend entries won ${Math.round(unconf.winRate * 100)}% (n=${unconf.n}) vs ${Math.round(conf.winRate * 100)}% (n=${conf.n}) for confirmed entries`,
+      })
+    }
+  }
+  return suggestions
+}
+
 // ── IMPORT TRADES (paste/upload CSV, e.g. from a spreadsheet trade log) ──────
 // Tolerant CSV/TSV parser + flexible header mapping so real-world exports
 // (mixed date formats, ₹-prefixed pnl, stray non-data rows) import cleanly.
@@ -1061,6 +1153,16 @@ export default function App() {
   const [tradeLog, setTradeLog] = useState(() => {
     try { return JSON.parse(localStorage.getItem('nifty_tradelog') || '[]') } catch { return [] }
   })
+  const [weightOverrides, setWeightOverrides] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('nifty_weight_overrides') || '{}') } catch { return {} }
+  })
+  const [ruleOverrides, setRuleOverrides] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('nifty_rule_overrides') || '{}') } catch { return {} }
+  })
+  const [dismissedSuggestions, setDismissedSuggestions] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('nifty_dismissed_suggestions') || '[]') } catch { return [] }
+  })
+  const [showSelfReview, setShowSelfReview] = useState(false)
 
   // Load expiries once
   useEffect(() => {
@@ -1132,8 +1234,12 @@ export default function App() {
       if (pdl && spot < pdl) belowPDLRef.current = belowPDLRef.current + 1
       else belowPDLRef.current = 0
 
-      const a = safe(() => analyse(rows, spot, dte, oiData, vix, pdh, pdl, ic, prevClose, prev2Close, ic5))
-      const rec = safe(() => getRec(rows, spot, a, vix, ic5, belowPDLRef.current), { type: 'No Trade', logic: 'Analysis error' })
+      const a = safe(() => analyse(rows, spot, dte, oiData, vix, pdh, pdl, ic, prevClose, prev2Close, ic5, weightOverrides))
+      let rec = safe(() => getRec(rows, spot, a, vix, ic5, belowPDLRef.current), { type: 'No Trade', logic: 'Analysis error' })
+      // Applied self-review overrides (see Algo Self-Review panel) — never silent, always logged in rec.logic
+      if (ruleOverrides.blockUnconfirmed && rec?.confirmed === false) {
+        rec = { ...rec, type: 'Wait', logic: `${rec.logic} [Override: unconfirmed entries blocked — see Algo Self-Review]` }
+      }
 
       // ATM crossover detection
       const atmRow = rows.length ? rows.reduce((b, r) => Math.abs(r.strike - spot) < Math.abs(b.strike - spot) ? r : b, rows[0]) : null
@@ -1168,7 +1274,7 @@ export default function App() {
       setUpdated(new Date())
     }).catch(e => setErr(String(e?.message || e)))
       .finally(() => setLoading(false))
-  }, [expiry, tick])
+  }, [expiry, tick, weightOverrides, ruleOverrides])
 
   // Auto-refresh every 15 min during market hours
   useEffect(() => {
@@ -1194,7 +1300,9 @@ export default function App() {
       spread: rec.spread,
       confirmed: rec.confirmed,
       spot: data.spot,
+      sigSnapshot: data.a?.sigSnapshot || null,   // per-signal votes at entry — feeds the Algo Self-Review scorecard
       exitPrice: null,
+      exitSpot: null,
       pnl: null,
     }
     const newLog = [entry, ...tradeLog].slice(0, 500)
@@ -1208,7 +1316,7 @@ export default function App() {
     const newLog = tradeLog.map(t => {
       if (t.id !== id) return t
       const pnl = Math.round((price - t.entryLTP) * LOT)  // always long: exit - entry × lots
-      return { ...t, exitPrice: price, pnl }
+      return { ...t, exitPrice: price, exitSpot: data?.spot ?? null, pnl }
     })
     setTradeLog(newLog)
     try { localStorage.setItem('nifty_tradelog', JSON.stringify(newLog)) } catch {}
@@ -1247,6 +1355,36 @@ export default function App() {
   }
 
   const perf = useMemo(() => computeDailyStats(tradeLog), [tradeLog])
+  const scorecard = useMemo(() => computeSignalScorecard(tradeLog), [tradeLog])
+  const suggestions = useMemo(
+    () => computeSuggestions(scorecard, weightOverrides, ruleOverrides, dismissedSuggestions),
+    [scorecard, weightOverrides, ruleOverrides, dismissedSuggestions]
+  )
+
+  const applySuggestion = (sug) => {
+    if (sug.type === 'weight') {
+      const next = { ...weightOverrides, [sug.id]: sug.to }
+      setWeightOverrides(next)
+      try { localStorage.setItem('nifty_weight_overrides', JSON.stringify(next)) } catch {}
+    } else if (sug.type === 'rule') {
+      const next = { ...ruleOverrides, [sug.id]: true }
+      setRuleOverrides(next)
+      try { localStorage.setItem('nifty_rule_overrides', JSON.stringify(next)) } catch {}
+    }
+  }
+  const dismissSuggestion = (key) => {
+    const next = [...dismissedSuggestions, key]
+    setDismissedSuggestions(next)
+    try { localStorage.setItem('nifty_dismissed_suggestions', JSON.stringify(next)) } catch {}
+  }
+  const resetOverrides = () => {
+    setWeightOverrides({}); setRuleOverrides({}); setDismissedSuggestions([])
+    try {
+      localStorage.removeItem('nifty_weight_overrides')
+      localStorage.removeItem('nifty_rule_overrides')
+      localStorage.removeItem('nifty_dismissed_suggestions')
+    } catch {}
+  }
 
   const a = data?.a
   const bias = a?.bias || 'NEUTRAL'
@@ -1840,6 +1978,130 @@ export default function App() {
                   </div>
                 )}
               </>)}
+            </div>
+          )}
+        </div>
+
+        {/* Algo Self-Review — signal scorecard + suggested tuning */}
+        <div style={{ margin: '10px 12px 0', background: '#0d1117', borderRadius: 12, border: '1px solid #1e2a3a', overflow: 'hidden' }}>
+          <div onClick={() => setShowSelfReview(s => !s)}
+            style={{ padding: '12px 16px', cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#475569' }}>ALGO SELF-REVIEW</div>
+              <div style={{ fontSize: 9, color: '#334155', marginTop: 2 }}>Which signals are actually right, and suggested tuning</div>
+            </div>
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+              {suggestions.length > 0 && (
+                <div style={{ fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 4, background: '#1c1400', color: '#fbbf24' }}>
+                  {suggestions.length} suggestion{suggestions.length > 1 ? 's' : ''}
+                </div>
+              )}
+              <div style={{ fontSize: 11, color: '#334155' }}>{showSelfReview ? '▲' : '▼'}</div>
+            </div>
+          </div>
+
+          {showSelfReview && (
+            <div style={{ borderTop: '1px solid #1e2a3a', padding: '14px 16px' }}>
+              <div style={{ fontSize: 10, color: '#334155', marginBottom: 14, lineHeight: 1.5 }}>
+                Ground truth here is whether spot actually moved the direction each signal voted, from entry to exit
+                — not option P&amp;L (which is noisy from theta/spread). Only trades logged live count toward this
+                (imported trades still count in Performance above, just not per-signal).
+                {scorecard.sampleSize < MIN_SIGNAL_N && (
+                  <span style={{ color: '#fb923c' }}> Currently {scorecard.sampleSize} attributable trade{scorecard.sampleSize === 1 ? '' : 's'} — signal hit-rates firm up after ~{MIN_SIGNAL_N}.</span>
+                )}
+              </div>
+
+              {/* Suggestions */}
+              {suggestions.length > 0 && (
+                <div style={{ marginBottom: 16 }}>
+                  <div style={{ fontSize: 9, color: '#475569', marginBottom: 8, fontWeight: 700 }}>SUGGESTED TUNING</div>
+                  {suggestions.map(sug => (
+                    <div key={sug.key} style={{ background: '#1c1400', border: '1px solid #92400e', borderRadius: 8, padding: 10, marginBottom: 8 }}>
+                      <div style={{ fontSize: 11, color: '#fbbf24', fontWeight: 700 }}>
+                        {sug.label}{sug.type === 'weight' ? ` weight ${sug.from} → ${sug.to}` : ''}
+                      </div>
+                      <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 4, lineHeight: 1.4 }}>{sug.reason}</div>
+                      <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+                        <button onClick={() => applySuggestion(sug)}
+                          style={{ background: '#1e3a5f', border: '1px solid #3b82f6', borderRadius: 4, color: '#60a5fa', padding: '4px 10px', fontSize: 10, fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit' }}>
+                          Apply
+                        </button>
+                        <button onClick={() => dismissSuggestion(sug.key)}
+                          style={{ background: 'transparent', border: '1px solid #334155', borderRadius: 4, color: '#64748b', padding: '4px 10px', fontSize: 10, cursor: 'pointer', fontFamily: 'inherit' }}>
+                          Dismiss
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Active overrides */}
+              {(Object.keys(weightOverrides).length > 0 || Object.keys(ruleOverrides).length > 0) && (
+                <div style={{ marginBottom: 16, padding: 10, background: '#0a0f1a', borderRadius: 8, border: '1px solid #1e2a3a' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                    <div style={{ fontSize: 9, color: '#475569', fontWeight: 700 }}>ACTIVE OVERRIDES</div>
+                    <button onClick={resetOverrides}
+                      style={{ background: 'transparent', border: '1px solid #334155', borderRadius: 4, color: '#64748b', padding: '2px 8px', fontSize: 9, cursor: 'pointer', fontFamily: 'inherit' }}>
+                      Reset to defaults
+                    </button>
+                  </div>
+                  {Object.entries(weightOverrides).map(([id, w]) => (
+                    <div key={id} style={{ fontSize: 10, color: '#94a3b8' }}>{SIGNAL_LABELS[id] || id} weight: {DEFAULT_WEIGHTS[id]} → {w}</div>
+                  ))}
+                  {ruleOverrides.blockUnconfirmed && <div style={{ fontSize: 10, color: '#94a3b8' }}>Unconfirmed entries: blocked</div>}
+                </div>
+              )}
+
+              {/* Signal scorecard */}
+              <div style={{ fontSize: 9, color: '#475569', marginBottom: 8, fontWeight: 700 }}>SIGNAL SCORECARD</div>
+              <div style={{ marginBottom: 16 }}>
+                {scorecard.signals.map(s => {
+                  const lowN = s.n < MIN_SIGNAL_N
+                  const hrCol = s.hitRate == null ? '#334155' : s.hitRate >= 0.55 ? '#22c55e' : s.hitRate <= 0.45 ? '#ef4444' : '#94a3b8'
+                  return (
+                    <div key={s.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 0', borderBottom: '1px solid #0f172a' }}>
+                      <div style={{ fontSize: 11, color: '#cbd5e1' }}>
+                        {s.label}
+                        {weightOverrides[s.id] != null && <span style={{ color: '#60a5fa', fontSize: 9, marginLeft: 6 }}>●</span>}
+                      </div>
+                      <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+                        <div style={{ fontSize: 9, color: '#334155' }}>w {s.currentWeight}</div>
+                        <div style={{ fontSize: 10, color: '#475569' }}>{s.n} obs{lowN && s.n > 0 ? ' (low n)' : ''}</div>
+                        <div style={{ fontSize: 12, fontWeight: 700, color: hrCol, minWidth: 36, textAlign: 'right' }}>
+                          {s.hitRate != null ? `${Math.round(s.hitRate * 100)}%` : '—'}
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+
+              {/* By regime */}
+              {scorecard.byRegime.length > 0 && (
+                <div style={{ marginBottom: 16 }}>
+                  <div style={{ fontSize: 9, color: '#475569', marginBottom: 8, fontWeight: 700 }}>WIN RATE BY REGIME</div>
+                  {scorecard.byRegime.map(r => (
+                    <div key={r.key} style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 0', borderBottom: '1px solid #0f172a', fontSize: 11 }}>
+                      <span style={{ color: '#cbd5e1' }}>{r.key}</span>
+                      <span style={{ color: '#475569' }}>{r.n} trade{r.n > 1 ? 's' : ''} · <span style={{ color: r.winRate >= 0.5 ? '#22c55e' : '#ef4444', fontWeight: 700 }}>{Math.round(r.winRate * 100)}%</span></span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Confirmed vs unconfirmed */}
+              {scorecard.byConfirmed.length > 0 && (
+                <div>
+                  <div style={{ fontSize: 9, color: '#475569', marginBottom: 8, fontWeight: 700 }}>CONFIRMED VS UNCONFIRMED</div>
+                  {scorecard.byConfirmed.map(c => (
+                    <div key={c.key} style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 0', borderBottom: '1px solid #0f172a', fontSize: 11 }}>
+                      <span style={{ color: '#cbd5e1' }}>{c.key}</span>
+                      <span style={{ color: '#475569' }}>{c.n} trade{c.n > 1 ? 's' : ''} · <span style={{ color: c.winRate >= 0.5 ? '#22c55e' : '#ef4444', fontWeight: 700 }}>{Math.round(c.winRate * 100)}%</span></span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </div>
