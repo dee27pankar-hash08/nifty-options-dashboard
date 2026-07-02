@@ -1324,6 +1324,18 @@ export default function App() {
     setExitInput('')
   }
 
+  const deleteTrade = (id) => {
+    const newLog = tradeLog.filter(t => t.id !== id)
+    setTradeLog(newLog)
+    try { localStorage.setItem('nifty_tradelog', JSON.stringify(newLog)) } catch {}
+  }
+
+  const clearAllTrades = () => {
+    if (!window.confirm(`Delete all ${tradeLog.length} logged trades? This can't be undone (export first if you want a backup).`)) return
+    setTradeLog([])
+    try { localStorage.removeItem('nifty_tradelog') } catch {}
+  }
+
   const importTrades = (text) => {
     if (!text || !text.trim()) return
     const { trades, skipped } = parseImportedTrades(text)
@@ -2125,6 +2137,12 @@ export default function App() {
                   ↓ export
                 </div>
               )}
+              {tradeLog.length > 0 && (
+                <div onClick={e => { e.stopPropagation(); clearAllTrades() }}
+                  style={{ fontSize: 10, color: '#f87171', cursor: 'pointer', padding: '2px 6px', border: '1px solid #7f1d1d', borderRadius: 3 }}>
+                  🗑 clear all
+                </div>
+              )}
               <div style={{ fontSize: 11, color: '#334155' }}>{showLog ? '▲' : '▼'}</div>
             </div>
           </div>
@@ -2141,7 +2159,12 @@ export default function App() {
                       {t.confirmed === false && <span style={{ fontSize: 9, color: '#fb923c', marginLeft: 6 }}>UNCONFIRMED</span>}
                     </div>
                     <div style={{ textAlign: 'right' }}>
-                      <div style={{ fontSize: 10, color: '#475569' }}>{t.time} {t.date}</div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'flex-end' }}>
+                        <div style={{ fontSize: 10, color: '#475569' }}>{t.time} {t.date}</div>
+                        <span onClick={() => deleteTrade(t.id)}
+                          style={{ fontSize: 11, color: '#475569', cursor: 'pointer', padding: '0 2px' }}
+                          title="Delete this trade">✕</span>
+                      </div>
                       {t.spot && <div style={{ fontSize: 10, color: '#334155' }}>Nifty ₹{t.spot.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</div>}
                     </div>
                   </div>
