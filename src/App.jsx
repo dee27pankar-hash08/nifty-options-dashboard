@@ -864,11 +864,26 @@ function getCombinedSignal(a, atmCeLtp, atmPeLtp, recentCrossoverType) {
 }
 
 // ── DAILY BACKTEST (from logged trades) ──────────────────────────────────────
-// Trade log entries carry date as 'DD/MM/YYYY' (en-IN locale) — parse for sort order.
+// Trade log entries carry date as 'D/M/YYYY' (en-IN locale) — parse for sort order.
+// Tolerant of both D/M/YYYY and M/D/YYYY (imported data may use either).
 const parseINDate = s => {
   if (!s) return null
-  const [d, m, y] = s.split('/').map(Number)
-  return d && m && y ? new Date(y, m - 1, d) : null
+  const m = String(s).trim().match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/)
+  if (!m) return null
+  let [, a, b, y] = m.map(Number)
+  if (y < 100) y += 2000
+  const day = a > 12 ? a : b > 12 ? b : a          // ambiguous → assume D/M
+  const month = a > 12 ? b : b > 12 ? a : b
+  if (day < 1 || day > 31 || month < 1 || month > 12) return null
+  return new Date(y, month - 1, day)
+}
+// Canonical grouping key — dates from different sources ('2/7/2026' vs '02/07/2026')
+// must land in the same day-bucket even though their raw strings differ.
+const dateKey = s => { const d = parseINDate(s); return d ? `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}` : 'Unknown' }
+const fmtDateKey = (key, fallback) => {
+  if (key === 'Unknown') return fallback || 'Unknown date'
+  const [y, m, d] = key.split('-').map(Number)
+  return `${d}/${m + 1}/${y}`
 }
 
 function computeDailyStats(tradeLog) {
@@ -878,8 +893,8 @@ function computeDailyStats(tradeLog) {
 
   const byDate = {}
   for (const t of closed) {
-    const key = t.date || 'Unknown'
-    if (!byDate[key]) byDate[key] = { date: key, trades: 0, wins: 0, losses: 0, pnl: 0 }
+    const key = dateKey(t.date)
+    if (!byDate[key]) byDate[key] = { key, date: fmtDateKey(key, t.date), trades: 0, wins: 0, losses: 0, pnl: 0 }
     byDate[key].trades += 1
     byDate[key].pnl += t.pnl
     if (t.pnl > 0) byDate[key].wins += 1; else byDate[key].losses += 1
@@ -899,6 +914,123 @@ function computeDailyStats(tradeLog) {
   return { days, openCount, summary: { totalPnl, totalTrades: closed.length, wins, losses, winRate, avgPnl, bestDay, worstDay } }
 }
 
+// ── IMPORT TRADES (paste/upload CSV, e.g. from a spreadsheet trade log) ──────
+// Tolerant CSV/TSV parser + flexible header mapping so real-world exports
+// (mixed date formats, ₹-prefixed pnl, stray non-data rows) import cleanly.
+function parseDelimited(text) {
+  const delim = text.slice(0, text.indexOf('\n') > -1 ? text.indexOf('\n') : text.length).includes('\t') ? '\t' : ','
+  const rows = []
+  let row = [], field = '', inQuotes = false
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]
+    if (inQuotes) {
+      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++ } else inQuotes = false }
+      else field += c
+    } else if (c === '"') inQuotes = true
+    else if (c === delim) { row.push(field); field = '' }
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++
+      row.push(field); field = ''
+      if (row.some(f => f.trim() !== '')) rows.push(row)
+      row = []
+    } else field += c
+  }
+  if (field !== '' || row.length) { row.push(field); if (row.some(f => f.trim() !== '')) rows.push(row) }
+  return rows
+}
+
+const IMPORT_ALIASES = {
+  date: ['date'], time: ['time'], regime: ['regime'], signal: ['signal'],
+  strike: ['strike'], entry: ['entryltp', 'entry'], exit: ['exitprice', 'exit'],
+  pnl: ['pnl'], sl: ['algosl', 'sl'], target: ['algotgt', 'target', 'tgt'],
+  rr: ['algorr', 'rr'], confirmed: ['confirmed'], spread: ['spread'],
+  spot: ['niftyspot', 'spot'], notes: ['notes'],
+}
+const normHeader = h => (h || '').toLowerCase().replace(/[^a-z]/g, '')
+
+function mapImportColumns(headerRow) {
+  const norm = headerRow.map(normHeader)
+  const map = {}
+  const used = new Set()
+  for (const [field, aliases] of Object.entries(IMPORT_ALIASES)) {
+    for (const alias of aliases) {
+      const idx = norm.findIndex((h, i) => !used.has(i) && h.includes(alias))
+      if (idx >= 0) { map[field] = idx; used.add(idx); break }
+    }
+  }
+  return map
+}
+
+const parseImportMoney = raw => {
+  if (raw == null) return null
+  const cleaned = String(raw).replace(/[₹,\s]/g, '')
+  if (cleaned === '' || cleaned === '-') return null
+  const n = parseFloat(cleaned)
+  return Number.isFinite(n) ? n : null
+}
+const normalizeImportSignal = raw => {
+  const t = (raw || '').trim()
+  const low = t.toLowerCase()
+  if (low === 'ce buy' || low === 'ce') return 'CE Buy'
+  if (low === 'pe buy' || low === 'pe') return 'PE Buy'
+  if (low === 'straddle') return 'Straddle'
+  return t
+}
+const parseImportConfirmed = raw => {
+  const low = (raw || '').trim().toLowerCase()
+  if (low === 'true' || low === 'yes') return true
+  if (low === 'false' || low === 'no') return false
+  return undefined
+}
+const hashStr = s => { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return Math.abs(h) }
+
+function parseImportedTrades(text) {
+  const rows = parseDelimited(text.trim())
+  if (!rows.length) return { trades: [], skipped: 0, total: 0 }
+
+  const looksLikeHeader = rows[0].some(c => normHeader(c).includes('date')) &&
+    rows[0].some(c => normHeader(c).includes('signal') || normHeader(c).includes('pnl'))
+  const map = looksLikeHeader ? mapImportColumns(rows[0]) : mapImportColumns(
+    ['date', 'time', 'regime', 'signal', 'strike', 'entry', 'exit', 'pnl', 'sl', 'target', 'rr', 'rrachieved', 'confirmed', 'spread', 'spot', 'notes']
+  )
+  const dataRows = looksLikeHeader ? rows.slice(1) : rows
+  const get = (r, field) => map[field] != null ? (r[map[field]] ?? '').trim() : ''
+
+  const trades = []
+  let skipped = 0
+  for (const r of dataRows) {
+    const strike = parseImportMoney(get(r, 'strike'))
+    const entryLTP = parseImportMoney(get(r, 'entry'))
+    const exitPrice = parseImportMoney(get(r, 'exit'))
+    let pnl = parseImportMoney(get(r, 'pnl'))
+    if (pnl == null && entryLTP != null && exitPrice != null) pnl = Math.round((exitPrice - entryLTP) * LOT)
+
+    // Sanity filter: a real trade needs a plausible Nifty strike, or (failing that) a
+    // recognized signal plus a pnl. Numeric-looking junk alone (e.g. a misaligned row
+    // or a pasted JSON fragment) isn't enough — this is what keeps those out.
+    const strikePlausible = strike != null && strike >= 5000 && strike <= 100000
+    const signal = normalizeImportSignal(get(r, 'signal'))
+    const hasRecognizedSignal = ['CE Buy', 'PE Buy', 'Straddle'].includes(signal)
+    if (!strikePlausible && !(hasRecognizedSignal && pnl != null)) { skipped++; continue }
+
+    const date = parseImportDateStr(get(r, 'date'))
+    trades.push({
+      date, time: get(r, 'time'), regime: get(r, 'regime') || '—',
+      signal, strike: strike ?? null, entryLTP, exitPrice, pnl,
+      sl: parseImportMoney(get(r, 'sl')), target: parseImportMoney(get(r, 'target')),
+      rr: parseImportMoney(get(r, 'rr')), confirmed: parseImportConfirmed(get(r, 'confirmed')),
+      spread: parseImportMoney(get(r, 'spread')), spot: parseImportMoney(get(r, 'spot')),
+    })
+  }
+  return { trades, skipped, total: dataRows.length }
+}
+
+function parseImportDateStr(raw) {
+  const d = parseINDate(raw)
+  return d ? `${d.getDate()}/${d.getMonth() + 1}/${d.getFullYear()}` : ''
+}
+const tradeSignature = t => `${t.date}|${t.time}|${t.strike}|${t.entryLTP}|${t.exitPrice}|${t.pnl}`
+
 // ── CONSTANTS ─────────────────────────────────────────────────────────────────
 const BC = { BULLISH: '#22c55e', 'CAUTIOUSLY BULLISH': '#86efac', 'CAUTIOUSLY BEARISH': '#fb923c', BEARISH: '#ef4444', NEUTRAL: '#94a3b8' }
 const RC = { 'CE Buy': '#22c55e', 'PE Buy': '#ef4444', Straddle: '#fb923c', 'No Trade': '#64748b', Wait: '#f59e0b' }
@@ -917,6 +1049,9 @@ export default function App() {
   const [showPerf, setShowPerf] = useState(true)
   const [exitingId, setExitingId] = useState(null)
   const [exitInput, setExitInput] = useState('')
+  const [showImport, setShowImport] = useState(false)
+  const [importText, setImportText] = useState('')
+  const [importMsg, setImportMsg] = useState('')
   const belowPDLRef = useRef(0)
   const prevATMRef = useRef({ ceLtp: null, peLtp: null })
   const [atmSignals, setAtmSignals] = useState(() => {
@@ -1079,6 +1214,36 @@ export default function App() {
     try { localStorage.setItem('nifty_tradelog', JSON.stringify(newLog)) } catch {}
     setExitingId(null)
     setExitInput('')
+  }
+
+  const importTrades = (text) => {
+    if (!text || !text.trim()) return
+    const { trades, skipped } = parseImportedTrades(text)
+    const existingSigs = new Set(tradeLog.map(tradeSignature))
+    let dupes = 0
+    const fresh = []
+    for (const t of trades) {
+      const sig = tradeSignature(t)
+      if (existingSigs.has(sig)) { dupes++; continue }
+      existingSigs.add(sig)
+      fresh.push({ id: 900000000000 + hashStr(sig), exitPrice: t.exitPrice ?? null, ...t })
+    }
+    const newLog = [...fresh, ...tradeLog].slice(0, 500)
+    setTradeLog(newLog)
+    try { localStorage.setItem('nifty_tradelog', JSON.stringify(newLog)) } catch {}
+    setImportMsg(`Imported ${fresh.length} trade${fresh.length === 1 ? '' : 's'}` +
+      (dupes ? ` · ${dupes} duplicate${dupes === 1 ? '' : 's'} skipped` : '') +
+      (skipped ? ` · ${skipped} row${skipped === 1 ? '' : 's'} unrecognized` : ''))
+    setImportText('')
+  }
+
+  const handleImportFile = (e) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    const reader = new FileReader()
+    reader.onload = () => importTrades(String(reader.result || ''))
+    reader.readAsText(file)
+    e.target.value = ''
   }
 
   const perf = useMemo(() => computeDailyStats(tradeLog), [tradeLog])
@@ -1570,9 +1735,43 @@ export default function App() {
 
           {showPerf && (
             <div style={{ borderTop: '1px solid #1e2a3a', padding: '14px 16px' }}>
+              {/* Import trades from a spreadsheet / CSV export */}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: showImport ? 10 : 14 }}>
+                <div style={{ fontSize: 10, color: '#334155' }}>Have a trade log spreadsheet? Bring it in to include it here.</div>
+                <button onClick={() => { setShowImport(s => !s); setImportMsg('') }}
+                  style={{ background: 'transparent', border: '1px solid #1e3a5f', borderRadius: 4, color: '#60a5fa', padding: '4px 10px', fontSize: 10, fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit', whiteSpace: 'nowrap' }}>
+                  {showImport ? '✕ Close' : '⇪ Import trades'}
+                </button>
+              </div>
+              {showImport && (
+                <div style={{ marginBottom: 14, padding: 12, background: '#0a0f1a', borderRadius: 8, border: '1px solid #1e2a3a' }}>
+                  <div style={{ fontSize: 10, color: '#64748b', marginBottom: 8, lineHeight: 1.5 }}>
+                    Paste rows copied from your sheet (or upload a .csv export). Expected columns: date, time, regime,
+                    signal, strike, entry, exit, pnl, sl, target, rr, confirmed, spread, spot — header order doesn't
+                    matter and missing columns are fine. Duplicate trades are skipped automatically.
+                  </div>
+                  <textarea value={importText} onChange={e => setImportText(e.target.value)}
+                    placeholder={'date,time,regime,signal,strike,entry,exit,pnl,...\n15/6/2026,10:45 AM,TRENDING UP,CE Buy,23900,132.6,162,1911,...'}
+                    rows={5}
+                    style={{ width: '100%', boxSizing: 'border-box', background: '#0d1117', border: '1px solid #1e2a3a', borderRadius: 6, color: '#cbd5e1', padding: 8, fontSize: 11, fontFamily: 'inherit', resize: 'vertical' }} />
+                  <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'center' }}>
+                    <button onClick={() => importTrades(importText)} disabled={!importText.trim()}
+                      style={{ background: importText.trim() ? '#1e3a5f' : '#1e2a3a', border: '1px solid #3b82f6', borderRadius: 6, color: importText.trim() ? '#60a5fa' : '#334155', padding: '8px 14px', fontSize: 11, fontWeight: 700, cursor: importText.trim() ? 'pointer' : 'default', fontFamily: 'inherit' }}>
+                      Import pasted rows
+                    </button>
+                    <label style={{ background: '#1e2a3a', border: '1px solid #334155', borderRadius: 6, color: '#94a3b8', padding: '8px 14px', fontSize: 11, fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit' }}>
+                      Upload .csv
+                      <input type="file" accept=".csv,.tsv,text/csv,text/plain" onChange={handleImportFile} style={{ display: 'none' }} />
+                    </label>
+                  </div>
+                  {importMsg && <div style={{ marginTop: 8, fontSize: 11, color: '#4ade80' }}>{importMsg}</div>}
+                </div>
+              )}
+
               {!perf.summary ? (
                 <div style={{ fontSize: 11, color: '#334155', padding: '8px 0' }}>
-                  No closed trades yet. Use “Log Entry” on a recommended trade, then “Log Exit” once you close it — daily profitability will build up here automatically.
+                  No closed trades yet. Use “Log Entry” on a recommended trade, then “Log Exit” once you close it —
+                  or import a trade log above — and daily profitability will build up here automatically.
                 </div>
               ) : (<>
                 {/* Summary tiles */}
@@ -1615,7 +1814,7 @@ export default function App() {
                     const pos = d.pnl >= 0
                     const halfWidthPct = Math.min(50, (Math.abs(d.pnl) / maxAbs) * 50)
                     return (
-                      <div key={d.date} style={{ marginBottom: 10 }}>
+                      <div key={d.key} style={{ marginBottom: 10 }}>
                         <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#64748b', marginBottom: 3 }}>
                           <span>{d.date} · {d.trades} trade{d.trades > 1 ? 's' : ''} · {d.winRate}% win</span>
                           <span style={{ fontWeight: 700, color: pos ? '#22c55e' : '#ef4444' }}>{pos ? '+' : ''}₹{d.pnl.toLocaleString('en-IN')}</span>
